@@ -178,6 +178,10 @@ func (h *Handler) setACLEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "acl.set", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), playbook, vars)
 	auditLog(r.Context(), r, "acl.set", name, err)
 	if err != nil {
@@ -296,6 +300,10 @@ func (h *Handler) removeACLEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "acl.remove", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), playbook, vars)
 	auditLog(r.Context(), r, "acl.remove", name, err)
 	if err != nil {

@@ -95,6 +95,10 @@ func (h *Handler) initSamba(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 1: check smbd is installed, back up existing conf, create usershares dir.
+	w, r, replayed := h.beginOperation(w, r, "smb.init", "")
+	if replayed {
+		return
+	}
 	out1, err := h.runOp(r.Context(), "smb_init.yml", map[string]string{})
 	auditLog(r.Context(), r, "smb.init", "", err)
 	if err != nil {
@@ -170,6 +174,10 @@ func (h *Handler) setSMBShare(w http.ResponseWriter, r *http.Request) {
 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
 		return
 	}
+	w, r, replayed := h.beginOperation(w, r, "smb_share.set", dataset)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "smb_usershare_set.yml", map[string]string{
 		"dataset":   dataset,
 		"sharename": req.Sharename,
@@ -199,6 +207,10 @@ func (h *Handler) deleteSMBShare(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validSMBShare(sharename) {
 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
+		return
+	}
+	w, r, replayed := h.beginOperation(w, r, "smb_share.delete", dataset)
+	if replayed {
 		return
 	}
 	out, err := h.runOp(r.Context(), "smb_usershare_unset.yml", map[string]string{
@@ -260,6 +272,10 @@ func (h *Handler) addSambaUser(w http.ResponseWriter, r *http.Request) {
 	}
 	h.userMu.Lock()
 	defer h.userMu.Unlock()
+	w, r, replayed := h.beginOperation(w, r, "smb_user.add", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "smb_user_add.yml", map[string]string{
 		"username":     name,
 		"smb_password": req.Password,
@@ -288,6 +304,10 @@ func (h *Handler) removeSambaUser(w http.ResponseWriter, r *http.Request) {
 	}
 	h.userMu.Lock()
 	defer h.userMu.Unlock()
+	w, r, replayed := h.beginOperation(w, r, "smb_user.remove", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "smb_user_remove.yml", map[string]string{
 		"username": name,
 	})
@@ -407,6 +427,10 @@ func (h *Handler) setSMBHomes(w http.ResponseWriter, r *http.Request) {
 		DirectoryMask: req.DirectoryMask,
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "smb_homes.set", req.Dataset)
+	if replayed {
+		return
+	}
 	out, err := h.applyConfig(r, &cfg)
 	auditLog(r.Context(), r, "smb_homes.set", req.Dataset, err)
 	if err != nil {
@@ -439,6 +463,10 @@ func (h *Handler) deleteSMBHomes(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.Homes = nil
 
+	w, r, replayed := h.beginOperation(w, r, "smb_homes.delete", "")
+	if replayed {
+		return
+	}
 	out, err := h.applyConfig(r, &cfg)
 	auditLog(r.Context(), r, "smb_homes.delete", "", err)
 	if err != nil {
@@ -537,6 +565,10 @@ func (h *Handler) createTimeMachineShare(w http.ResponseWriter, r *http.Request)
 		cfg.TimeMachine = append(cfg.TimeMachine, newShare)
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "smb_timemachine.create", req.Dataset)
+	if replayed {
+		return
+	}
 	out, err := h.applyConfig(r, &cfg)
 	auditLog(r.Context(), r, "smb_timemachine.create", req.Dataset, err)
 	if err != nil {
@@ -582,6 +614,10 @@ func (h *Handler) deleteTimeMachineShare(w http.ResponseWriter, r *http.Request)
 	}
 	cfg.TimeMachine = filtered
 
+	w, r, replayed := h.beginOperation(w, r, "smb_timemachine.delete", sharename)
+	if replayed {
+		return
+	}
 	out, err := h.applyConfig(r, &cfg)
 	auditLog(r.Context(), r, "smb_timemachine.delete", sharename, err)
 	if err != nil {

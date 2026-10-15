@@ -94,6 +94,10 @@ func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
 		"create_group": createGroup,
 		"smb_user":     smbUser,
 	}
+	w, r, replayed := h.beginOperation(w, r, "user.create", req.Username)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "user_create.yml", vars)
 	auditLog(r.Context(), r, "user.create", req.Username, err)
 	if err != nil {
@@ -152,6 +156,10 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 
 	h.userMu.Lock()
 	defer h.userMu.Unlock()
+	w, r, replayed := h.beginOperation(w, r, "user.delete", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "user_delete.yml", map[string]string{
 		"username": name,
 		"uid":      fmt.Sprintf("%d", target.UID),
@@ -247,6 +255,10 @@ func (h *Handler) modifyUser(w http.ResponseWriter, r *http.Request) {
 
 	h.userMu.Lock()
 	defer h.userMu.Unlock()
+	w, r, replayed := h.beginOperation(w, r, "user.modify", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "user_modify.yml", map[string]string{
 		"username":      name,
 		"uid":           fmt.Sprintf("%d", target.UID),
@@ -340,6 +352,10 @@ func (h *Handler) addSSHKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "sshkey.add", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "user_ssh_key_add.yml", map[string]string{
 		"username": name,
 		"home":     target.Home,
@@ -395,6 +411,10 @@ func (h *Handler) removeSSHKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "sshkey.remove", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "user_ssh_key_remove.yml", map[string]string{
 		"home": target.Home,
 		"key":  req.Key,
@@ -429,6 +449,10 @@ func (h *Handler) createGroup(w http.ResponseWriter, r *http.Request) {
 
 	h.userMu.Lock()
 	defer h.userMu.Unlock()
+	w, r, replayed := h.beginOperation(w, r, "group.create", req.Groupname)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "group_create.yml", map[string]string{
 		"groupname": req.Groupname,
 		"gid":       req.GID,
@@ -484,6 +508,10 @@ func (h *Handler) deleteGroup(w http.ResponseWriter, r *http.Request) {
 
 	h.userMu.Lock()
 	defer h.userMu.Unlock()
+	w, r, replayed := h.beginOperation(w, r, "group.delete", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "group_delete.yml", map[string]string{
 		"groupname": name,
 		"gid":       fmt.Sprintf("%d", target.GID),
@@ -582,6 +610,10 @@ func (h *Handler) modifyGroup(w http.ResponseWriter, r *http.Request) {
 
 	h.userMu.Lock()
 	defer h.userMu.Unlock()
+	w, r, replayed := h.beginOperation(w, r, "group.modify", name)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "group_modify.yml", map[string]string{
 		"groupname":      name,
 		"gid":            fmt.Sprintf("%d", target.GID),

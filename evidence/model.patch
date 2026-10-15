@@ -1,0 +1,5056 @@
+diff --git a/.trae/specs/operation-tracking/review.md b/.trae/specs/operation-tracking/review.md
+new file mode 100644
+index 0000000..a4f7d61
+--- /dev/null
++++ b/.trae/specs/operation-tracking/review.md
+@@ -0,0 +1,87 @@
++# Independent Review — 操作标识与可恢复进度
++
++- **Reviewer**: Independent review agent（全新上下文、只读）
++- **Date**: 2026-10-15
++- **Result**: R1 fail（1 major/4 minor/7 nit）→ 修复全部可处置项 → **R2 pass**（仅剩 2 条接受的既有架构附注 + 文档 nit 已修）
++- **Blocked By**: 9 个端到端集成用例无法在本机运行（无 limactl/Lima VM）；`go vet -tags integration` 编译通过。AC-1/3/4/5/6/8 的端到端断言仅有单测+走查证据；未做真实断网浏览器演练（已有真实 happy-path 浏览器冒烟与恢复路径代码走查）。
++
++## Checkpoints
++
++### Rule（对应 AC）
++
++| CP | 覆盖 | 初审 |
++|----|------|------|
++| CP-R1 | AC-1 标识与响应头 | PASS |
++| CP-R2 | AC-2 两车道统一序号/唯一终态 | PASS |
++| CP-R3 | AC-3 跨标签页隔离 | PASS |
++| CP-R4 | AC-4 SSE 重连续传 | R1 FAIL（REV-1/2）→ **R2 PASS（修复 VERIFIED + 字节窗口回归测试）** |
++| CP-R5 | AC-5 慢消费者同路径恢复（单测） | PASS |
++| CP-R6 | AC-6 断连后台完成/幂等 | PASS |
++| CP-R7 | AC-7 过期 410 | PASS |
++| CP-R8 | AC-8 兼容性（响应体/jobs/缓存/调用点） | PASS |
++| CP-R9 | AC-9 有界历史 | PASS |
++| CP-R10 | AC-10 日志审计关联 | PASS（REV-4 补 error 文本） |
++| CP-R13 | AC-13 build/vet/test/race | PASS；集成 BLOCKED（无 VM） |
++
++### Rubric
++
++| CP | 维度 | 初审 |
++|----|------|------|
++| CP-U1 | AC-11 网络中断恢复体验 | 4/5（REV-12 文案） |
++| CP-U2 | AC-12 抽象统一/迁移质量 | 4/5（REV-3 action 占位符） |
++| CP-U3 | 表现保真 | PASS |
++
++## Findings
++
++| ID | 级别 | 位置 | 问题 | 处置 |
++|----|------|------|------|------|
++| REV-1 | major | internal/api/operations_handlers.go | snapshot/增量分支用操作记录环 SeqFirst 判定，而增量来自独立 Journal（512KiB 字节上限）；字节淘汰早于记录环时 since=k 精确恢复静默丢步、不补 snapshot，违反 FR-11/AC-4 | 修复：Subscribe 前置并以 journal.OldestSeq() 判定；补单测 |
++| REV-2 | minor | operations_handlers.go SSE | snapshot 先于 Subscribe，两调用间步骤在 snapshot 模式既不入快照也不回放 | 修复：先 Subscribe 后 Snapshot，snapshot 模式仅发送 seq>snapshotLast 的事件 |
++| REV-3 | minor | device_handlers.go:106 | begin action 传了占位符字面量 "action"，与 audit 的 pool.device_offline/online 不一致 | 修复：改用参数 action |
++| REV-4 | minor | internal/operations/operation.go | operation finished 日志缺失败 error 文本（FR-15） | 修复：失败时带 error 字段 |
++| REV-5 | minor | operations_handlers.go | GET 形态非法 ID 返回 400，规格 FR-10 要求 404（POST 非法头才是 400） | 修复：lookup 非法 ID 映射 404；坏 since 仍 400 |
++| REV-6 | nit | README.md、AGENTS.md、ops.go 包注释 | 仍描述向 ansible.progress 主题发布（已无发布者） | 修复：同步措辞 |
++| REV-7 | nit | auth_handlers.go changePassword | begin target 传 ""，audit 为 username | 修复：执行前读 cfg.Username 传入 |
++| REV-8 | nit | operation.go truncateMsg | maxBytes=2 假设下 cut=-1 可 panic（生产不可达） | 修复：cut<=0 返回 "…" |
++| REV-9 | nit | zfs_handlers.go deleteSnapshotBatch | ReleaseHoldsFor 在 begin 之前 shell out（既有代码、best-effort 近似幂等） | 接受：不扩大本次改动，记录在案 |
++| REV-10 | nit | 全局无 panic recovery | handler panic 会使在途操作停留 running（既有架构问题） | 接受：后续中间件层独立改进，不在本期范围 |
++| REV-11 | nit | wiki/API-Reference.md Bounds | 未列慢消费者缓冲 32 | 修复：补文档 |
++| REV-12 | nit | static/js/utils.js | 410 直接显示英文服务端文案 | 修复：前端固定中文不可恢复文案 |
++
++## 安全审查
++
++无发现：ID 严格正则；since 数字白名单；操作端点位于鉴权中间件之后；密码经 stdin 不经 argv/extra-vars，步骤日志不含 msg/变量值；410/404 无额外信息泄漏；指标 status 标签仅 3 枚举。
++
++## 门禁证据（独立运行，-count=1）
++
++- `go build ./...` exit 0
++- `go vet ./...` exit 0
++- `go test -count=1 ./...` 15 包全 ok
++- `go test -race -count=1 ./internal/broker ./internal/operations ./internal/api` 无 DATA RACE
++- `node --check` 三个前端文件 OK
++- grep 对账：生产 52 个执行点 / 53 处 begin（差异由 applyConfig 透传 +3、双 playbook -2 解释）；65 个前端变更调用点零改动
++
++---
++
++## Review History
++
++### R1 — Independent review agent — 2026-10-15
++
++- **Result**: fail
++- **Findings**: 1 major / 4 minor / 7 nit（REV-1…REV-12，见上表）
++- **Evidence**: 见上"门禁证据"；锁顺序 m.mu→op.mu→journal.mu 无环；50 并发 Start 仅 1 created；10k 有界；断连 failingWriter 终态可查单测；浏览器真实冒烟全 PASS（实现阶段证据，非审查员执行）
++- **Blocked By**: Lima VM 缺失，9 个集成用例未运行；未做真实断网浏览器演练
++
++### R2 — Independent review agent R2 — 2026-10-15
++
++- **Result**: **pass**
++- **Scope**: 对 R1 修复的全新上下文只读复核 + 回归扫描。
++- **Findings 复核**: REV-1/2/3/4/5/6/7/8/11/12 全部 VERIFIED；REV-9/10 接受理由成立（git diff 证明 ReleaseHoldsFor 为未触及的既有 best-effort 代码；全仓无 recover() 属既有架构，操作历史不跨重启）。
++- **R2 新发现及处置**: R2-N1（wiki topics 表仍宣称 ansible.progress 在 playbook 期间推送）已修复（改表+退役说明）；R2-N2（CLAUDE.md 同款陈旧措辞）已修复；R2-N3（select(ch,done) 随机序可能先送 finished 漏尾部缓冲 step）已加固——done 分支先非阻塞排空 ch 再发 finished；R2-N4（changePassword begin/audit 两次加锁读用户名的理论 TOCTOU）接受：仅影响日志关联文本、属既有配置并发语义，不阻断。
++- **Evidence**:
++  - REV-1/2：Subscribe 先于 Snapshot、窗口判定改用 journal.OldestSeq()（operations_handlers.go）；八种时序组合走查无缺口/重复/泄漏；新增 TestOperationEventsJournalByteWindowTriggersSnapshot（40×16KiB 步真实构造 journal 窗口早于记录环，含 journalOldest>recordFirst 硬断言，双向断言 snapshot/incremental）。
++  - REV-5：GET/events 非法 ID→404、坏 since→400、POST 坏头→400 三路单测实测。
++  - REV-8：truncateMsg 对 maxBytes 0–8/16KiB × ASCII/CJK/emoji/混合输入独立实证 UTF-8 合法、不 panic。
++  - REV-11：500/16KiB/200/1h/256/32 与代码常量逐一相符。
++  - 门禁（R2 独立重跑）：`go build ./...`、`go vet ./...`、`go vet -tags integration ./tests/integration/...` exit 0；`go test -count=1 ./...` 15 包全 ok；`go test -race -count=1 ./internal/broker ./internal/operations ./internal/api` 无 DATA RACE（operations/broker 另 -count=3 重复干净）；node --check 三文件 OK；改动包 gofmt 干净。
++- **Blocked By**: Lima VM 缺失，集成用例未运行（同 R1）。
+diff --git a/.trae/specs/operation-tracking/spec.md b/.trae/specs/operation-tracking/spec.md
+new file mode 100644
+index 0000000..5da6308
+--- /dev/null
++++ b/.trae/specs/operation-tracking/spec.md
+@@ -0,0 +1,216 @@
++# 操作标识与可恢复进度（Operation Tracking & Resumable Progress）— 产品需求文档
++
++## Overview
++
++- **Summary**：为每个经 API 接纳的存储/共享类变更分配稳定的操作标识（operation ID），Ansible playbook 与本地 ops 两条执行路径在同一操作下发布带单调序号的有序步骤与唯一终态；浏览器按操作标识订阅/查询进度，实现跨标签页隔离、断线/SSE 重连续传不重复、慢订阅者回放恢复、客户端断连后后台执行结果可确定查询、过期操作明确不可恢复。
++- **Purpose**：消除当前全局 `ansible.progress` 主题导致的跨窗口步骤串流，消除 `PublishNoCache` 无历史导致的重连丢步骤，消除网络中断后"变更已接纳但结果未知"的状态。
++- **Target Users**：在多个标签页并发管理 dumpstore 的管理员；通过不稳定网络（无线、VPN、笔记本休眠）操作 NAS 的管理员；依赖 journald/审计日志排查变更的运维人员。
++
++## Goals
++
++- 变更接纳即生成稳定操作标识，标识可订阅（SSE）、可查询（REST）、可关联日志审计。
++- 两条执行路径（`internal/ansible`、`internal/ops`）统一到同一操作抽象：同一步骤序号空间、同一终态机。
++- 浏览器严格只展示本请求的步骤；SSE 重连（含 broker 丢弃慢订阅者触发的重连）从最后确认位置补齐且不重复。
++- 成功、任务失败、执行超时、客户端断开后后台继续执行四种情形均留下可确定查询的最终结果；过期结果以明确的不可恢复响应返回。
++- 保留单窗口正常网络下的全部现有表现、HTTP 成功/错误响应内容、普通缓存主题与 `jobs.update` 行为。
++- 进度历史严格有界；日志与审计可用操作标识串联接纳请求、步骤与终态。
++
++## Non-Goals
++
++- 不改变 jobs 长任务通道（`zfs send | recv`、`zfs rewrite`）：`/api/jobs*`、`jobs.update`、作业持久化语义保持不变。
++- 不做操作记录的跨重启磁盘持久化：操作历史为进程内有界数据；服务重启时进行中的 playbook/ops 子进程随服务终止，不存在孤儿变更（jobs 通道的既有中断语义另当别论）。
++- 不新增操作的列表/检索 UI 或主动通知中心；本期仅支持按标识查询与订阅。
++- 不引入构建步骤或前端框架（沿用 Vanilla JS + 事件委托约定）。
++- 不改变任何 playbook 内容、校验规则与系统资源所有权模型。
++
++## Background & Context
++
++现状证据（代码库勘察）：
++
++- 两条写路径的步骤都发布到**单一全局主题** `ansible.progress`：
++  [handlers.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/api/handlers.go#L253-L266) 中 `runOp`/`runLocal` 均调用 `h.broker.PublishNoCache("ansible.progress", step)`，载荷 `ansible.TaskStep` 不含任何操作归属字段。
++- 前端唯一过滤条件是"op-log 对话框打开且关闭按钮禁用"：
++  [loader.js](file:///Users/vance/project/mineProject/swe/09101010/project-01/static/js/loader.js#L191-L199) —— 任何标签页触发的步骤都会进入另一个标签页正在运行的对话框。
++- `PublishNoCache` 不保留历史：
++  [broker.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/broker/broker.go#L114-L126)；SSE 事件也不写 `id:` 字段
++  （[handlers.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/api/handlers.go#L494-L508)），浏览器无法用 Last-Event-ID 续传。
++- 慢订阅者通道写满即被 broker 关闭（[broker.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/broker/broker.go#L78-L96)），重连后缺口永久存在。
++- 执行已对客户端断连免疫（`context.WithoutCancel`：
++  [runner.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/ansible/runner.go#L139)、
++  [ops.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/ops/ops.go#L113-L116)），但终态只写进当次 HTTP 响应；响应丢失即结果未知，且无任何按标识查询的途径。
++- 超时只表现为普通 500 文本（ansible 5 分钟、ops 每步 5 分钟），无独立终态分类。
++- 全部 `runOp`/`runLocal` 调用（共 47 个执行点，分布在 12 个 handler 文件）仅存在于 `internal/api`；同一请求可能连续执行两个 playbook（如 `tlsAcmeIssue`、`initSamba`），天然属于"一个接纳请求 = 一个操作"。
++- jobs 通道已有成熟的有界保留/持久化模型（[manager.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/jobs/manager.go#L30-L39) retain=50），可作为操作注册表单有界策略的参照，但不共享实现。
++- `req_id` 已由日志中间件注入 ctx（[middleware.go](file:///Users/vance/project/mineProject/swe/09101010/project-01/internal/logging/middleware.go#L28-L35)），可与操作标识双向关联。
++
++## Functional Requirements
++
++### 接纳与标识
++
++- **FR-1**：变更请求在通过全部输入校验、真正开始执行前，由服务端建立操作记录；未通过校验的请求（4xx）不产生操作。
++- **FR-2**：操作 ID 稳定且唯一。浏览器对变更请求生成客户端 ID（`X-Operation-ID: op_<UUID>` 形态，受严格正则约束）；服务端优先采用客户端 ID，无该头时自行生成 24 位 hex ID。
++- **FR-3**：幂等接纳：同一 ID 在历史保留期内重复 POST 不重复执行变更——操作仍在运行返回 409 规范响应；已到终态则按记录的终态重放确定性结果（成功 200 / 失败或超时 500 的规范 JSON）；已过期返回 410。
++- **FR-4**：每个被接纳的变更，其**首个** HTTP 响应携带 `X-Operation-ID` 响应头（在 `WriteHeader` 之前写入）；正常成功/失败响应体与状态码形状保持现状。
++- **FR-5**：一个 HTTP 请求内连续调用多个 playbook/ops 执行（如 tls 签发后写配置、smb init 后 apply）归属同一操作，步骤共享同一序号空间，终态按"失败优先于成功、超时优先于普通失败"唯一确定。
++
++### 统一步骤与终态
++
++- **FR-6**：`runOp` 与 `runLocal` 的每个步骤写入所属操作：步骤带操作内单调递增、无空洞的整数序号 `seq`（从 1 开始），字段保持 `name/status/msg` 现有形状。
++- **FR-7**：操作终态机为 `running → succeeded | failed | timeout`，终态一次性写入且之后不可变；终态记录包含 `status`、`error`（失败/超时时的错误文本）、全部保留步骤、`started_at`、`finished_at`、`action`、`target`、`req_id`。
++- **FR-8**：执行超时被分类为 `timeout` 终态（ansible playbook 超时、ops 单步超时），错误文本保留；成功为 `succeeded`；其余执行错误为 `failed`。
++- **FR-9**：客户端断连不取消执行（沿用 WithoutCancel）；处理协程走到终态后写入操作记录，此后任意时刻可按 ID 查询到确定结果。
++
++### 订阅、查询与恢复
++
++- **FR-10**：新增 `GET /api/operations/{id}`：返回操作完整当前记录（running 亦可查询）；ID 形态非法或从未存在返回 404；已淘汰过期返回 `410 Gone`，响应体为明确的不可恢复结果（含 `recoverable:false`）。
++- **FR-11**：新增 `GET /api/operations/{id}/events`（SSE，同源 cookie 鉴权，与现有 /api 一致）：
++  - 连接建立后先发送一个 `op.snapshot` 事件（操作完整记录，全量替换语义），随后实时发送 `op.step`（含 seq）与终态 `op.finished`；
++  - 每条 SSE 事件写 `id: <seq>` 行；支持浏览器重连自动携带的 `Last-Event-ID` 头与等价 `?since=<n>` 参数，仅重放序号之后的事件；缺口早于保留窗口时以 `op.snapshot` 全量补齐；
++  - 慢订阅者通道满时按现有 broker 同样策略丢弃并断开该 SSE 连接，浏览器自动重连后走同一回放路径，不丢步骤、不产生永久缺口；
++  - 对已终态操作的订阅：发送 snapshot（及缺失时的 finished）后由客户端关闭；服务端保持 30s 心跳；过期 ID 返回 410。
++- **FR-12**：前端每个变更对话框只订阅自己那次请求的操作事件：
++  - snapshot 全量替换步骤列表；`op.step` 按 seq 去重后增量追加；
++  - fetch 正常返回时仍以 HTTP 响应中的 `tasks` 做最终整表渲染（保持现有最终表现）；
++  - fetch 因网络错误失败（响应不可达）时，对话框进入"正在恢复结果"状态，用已知客户端 ID 轮询 REST 并重连 SSE 直到终态或 410；终态后渲染与现状一致的步骤与错误，410 时显示明确的不可恢复提示。
++- **FR-13**：前端移除对全局 `ansible.progress` 主题的监听；全局主题不再有新的发布者（主题名保留在 ValidTopics 中不破坏旧订阅者连接，仅不再产出数据）。
++
++### 有界性与可观测
++
++- **FR-14**：进度历史严格有界：单操作保留步骤设条数与单条消息字节上限（环形淘汰，序号不回收）；注册表按"终态操作最大条数 + 终态后最长存活时间"淘汰；过期 ID 以有界 tombstone 环支持 410 判定。
++- **FR-15**：新增结构化日志：接纳（`operation accepted`，含 op_id/req_id/action/target）、每个步骤（debug 级，含 op_id/seq/name/status）、终态（`operation finished`，含 op_id/status/duration_ms/error）；既有 `audit` 审计行自动带上 op_id（与 req_id 同现），可在 journald 中用 op_id 串联接纳、步骤、终态。
++- **FR-16**：Prometheus 指标覆盖操作接纳数、按终态分类的完成数、当前进行中操作数（`/metrics` 常开，沿用既有指标风格）。
++
++## Non-Functional Requirements
++
++- **NFR-1（兼容性）**：正常网络下单窗口操作表现与当前像素级一致：运行中实时追加步骤、结束时以最终响应整表渲染、成功 toast、失败红色错误条；成功 JSON 与 `apiError` JSON 的字段/状态码不增不改（操作 ID 仅经响应头传递）。
++- **NFR-2（隔离性）**：两个标签页并发变更时，任一标签页的 SSE 事件流、对话框步骤、恢复过程互不串扰。
++- **NFR-3（健壮性）**：订阅/重连/恢复路径对网络中断、服务端慢消费者断开、事件重复到达、事件乱序到达均收敛到一致视图；所有并发访问线程安全。
++- **NFR-4（资源）**：高频变更压测下（测试中以 10k 操作模拟）注册表内存占用恒定有界；步骤消息截断不影响执行本身。
++- **NFR-5（安全）**：操作 ID 与 since 参数严格白名单校验；操作端点位于 `/api/` 鉴权之后；extra-vars 仍只记键不记值；历史中不出现密码等敏感字段（沿用现有步骤载荷约定）。
++- **NFR-6（可测）**：所有新单元测试不依赖外部进程（`go test ./...` 可跑）；VM 集成测试覆盖端到端恢复场景；`go build ./...`、`go vet ./...`、`go test ./...` 全绿。
++
++## Constraints
++
++- **Technical**：Go 1.22+ ServeMux 模式路由；Vanilla JS 无构建；沿用 `internal/broker` 现有非阻塞投递/慢消费者断开模型扩展有序回放原语；执行器对客户端取消免疫的既有行为不变。
++- **Business / 流程**：全量模板渲染等 AGENTS.md 红线不变；变更覆盖 ~47 个执行点，须机械一致地迁移，不得在调用点引入临时分叉；文档（wiki/API-Reference、wiki/Architecture、docs/index.html 端点清单）随路由同步更新。
++- **Dependencies**：无新外部依赖；UUID 由浏览器 `crypto.randomUUID()` 生成，Go 端沿用 `crypto/rand`。
++
++## Assumptions
++
++- 进行中的变更不跨服务重启存活；进程内有界历史足以满足"可确定查询"的时间窗（终态后默认保留 1 小时且总数封顶）。
++- 单标签页内 op-log 为模态对话框，同一时刻只有一个变更处于前台运行；后台 jobs（send/rewrite）不经此对话框与操作通道。
++- 浏览器支持 EventSource 的 Last-Event-ID 与 `crypto.randomUUID`（当前支持的现代浏览器均可）；不支持时回退为 REST 轮询恢复。
++- 默认有界参数（实现为命名常量、便于评审）：单操作 ≤ 500 步骤、单条 msg ≤ 16 KiB；终态操作保留 ≤ 200 条且终态后 ≤ 1 小时；tombstone 环 ≤ 256 条、存活 ≤ 1 小时；SSE 慢消费者通道 32。
++
++## Acceptance Criteria
++
++### AC-1: 被接纳变更获得稳定操作标识并经响应头返回
++- **Type**: `rule`
++- **Given**：管理员通过校验提交一个会触发 playbook 或 ops 的变更
++- **When**：服务端接纳并开始执行
++- **Then**：首个响应包含形态合法且全局唯一的 `X-Operation-ID`，且 GET 该 ID 能取到 running/终态记录；校验失败（4xx）响应无该头且无记录
++- **Pass Condition**：集成测试断言成功/失败响应均带头且 GET 可查；400 请求无头无记录
++- **Evidence**：`tests/integration` 新增用例；`internal/operations` 与 `internal/api` 单元测试
++
++### AC-2: 两条执行路径在同一操作下发布有序步骤与唯一终态
++- **Type**: `rule`
++- **Given**：任一 runOp 或 runLocal 变更（含一请求两个 playbook 的场景）
++- **When**：步骤依次完成、操作结束
++- **Then**：记录中步骤 seq 从 1 单调连续；终态恰为 succeeded/failed/timeout 之一且只写一次，再 Finish 为 no-op
++- **Pass Condition**：单元测试断言序号连续、终态一次冻结、双 playbook 请求共享序号空间且失败优先
++- **Evidence**：`internal/operations` 单元测试；tls/smb 类处理路径走查证据
++
++### AC-3: 跨标签页进度严格隔离
++- **Type**: `rule`
++- **Given**：标签页 A、B 几乎同时发起不同变更并各自打开操作日志
++- **When**：两边步骤交叉到达
++- **Then**：A 的订阅（`/api/operations/{A-id}/events`）只收到 A 的步骤，B 同理；两个对话框内容互不包含对方步骤
++- **Pass Condition**：集成/浏览器验证两操作事件流零交叉；前端事件处理器仅接受本对话框绑定 ID
++- **Evidence**：集成测试并发两个变更并分别消费各自 SSE；前端代码审查证据
++
++### AC-4: SSE 重连按最后确认位置补齐且不重复
++- **Type**: `rule`
++- **Given**：操作进行中客户端已确认到 seq=k
++- **When**：网络中断后 EventSource 自动重连（携带 Last-Event-ID=k）
++- **Then**：服务端只重放 seq>k 的 step/finished；若 k 早于保留窗口，先给 op.snapshot 全量；客户端视图无重复步骤、无缺口
++- **Pass Condition**：单元测试覆盖 since=k 精确回放、since 越界 snapshot、重复 seq 去重；集成测试中断开 SSE 后重连断言步骤集合完整且唯一
++- **Evidence**：`broker.Journal` 与 operations SSE 测试、集成测试输出
++
++### AC-5: 慢订阅者被断开后沿同一恢复路径继续
++- **Type**: `rule`
++- **Given**：某 SSE 消费者不读取事件直至通道满
++- **When**：broker 按现有策略关闭其通道
++- **Then**：HTTP SSE 连接结束→EventSource 自动重连→按 Last-Event-ID 回放补齐，期间发布的步骤零丢失
++- **Pass Condition**：单元测试制造慢消费者，断言其被断开且重连后拿到完整序号序列
++- **Evidence**：`broker.Journal` 慢消费者测试
++
++### AC-6: 断连后后台执行的四类结果均可确定查询
++- **Type**: `rule`
++- **Given**：变更执行期间客户端 TCP 断开（或 POST 响应丢失），浏览器持有客户端生成的操作 ID
++- **When**：操作分别走到成功、任务失败、执行超时
++- **Then**：GET 操作记录分别得到 status=succeeded/failed/timeout，含 error（失败/超时）、全部步骤、finished_at；重复 POST 同一 ID 不二次执行（运行中 409、终态重放同结果、过期 410）
++- **Pass Condition**：集成测试中断 HTTP 连接后轮询到三类确定终态；重复 POST 断言底层动作只发生一次（副作用计数）
++- **Evidence**：集成测试 + 单元测试（幂等接纳状态机）
++
++### AC-7: 过期操作返回明确不可恢复结果
++- **Type**: `rule`
++- **Given**：操作记录终态后被有界策略淘汰（tombstone 尚在或更久）
++- **When**：客户端 GET 或订阅该 ID
++- **Then**：返回 410，JSON 明确表达不可恢复（`recoverable:false`、稳定错误文案）；前端显示不可恢复提示而非无限等待
++- **Pass Condition**：单元测试驱动淘汰后 GET/SSE 均 410；前端恢复逻辑对 410 有终止渲染
++- **Evidence**：operations 管理器 410 测试；前端代码走查
++
++### AC-8: 现有单窗口表现、HTTP 内容、缓存主题与 jobs 行为保持
++- **Type**: `rule`
++- **Given**：正常网络的单个标签页
++- **When**：完成一次成功与一次失败变更，并观察数据刷新与 jobs 页面
++- **Then**：成功响应体字段/状态码与 `apiError` 失败体（error/tasks）形状不变；实时步骤与最终整表渲染行为不变；`*.query`/`poolstatus`/`iostat` 等缓存主题语义不变；`jobs.update`、`/api/jobs*` 行为与载荷不变
++- **Pass Condition**：对比改动前后响应 JSON（集成测试断言既有字段仍存在且无新增必填字段）；jobs 既有集成用例不改动且通过
++- **Evidence**：集成测试；`git diff` 确认 jobs/cache 相关代码无行为改动
++
++### AC-9: 进度历史严格有界
++- **Type**: `rule`
++- **Given**：持续接纳远超保留上限的操作与超大步骤消息
++- **When**：注册表执行淘汰
++- **Then**：终态记录数 ≤ 上限、TTL 到期被清；单操作步骤条数/消息字节被截断（序号不回收）；tombstone 不超环容量；内存不随累计操作数增长
++- **Pass Condition**：单元测试注入 10,000 个完成操作断言存量恒定；大 msg 被截断为上限
++- **Evidence**：operations 有界性测试
++
++### AC-10: 日志与审计可用操作标识完成三段关联
++- **Type**: `rule`
++- **Given**：一次被接纳的变更
++- **When**：检查 journald 日志输出
++- **Then**：存在带同一 op_id 的 accepted 行、逐步 debug 行（含 seq）、finished 行；既有 audit 行含 op_id 与 req_id；请求行 req_id 可与之关联
++- **Pass Condition**：单元/人工捕获日志断言四类记录 op_id 一致且 audit 含 req_id+op_id
++- **Evidence**：日志捕获测试或 dev 模式冒烟输出
++
++### AC-11: 浏览器网络中断恢复体验
++- **Type**: `rubric`
++- **Dimension**：恢复过程的可理解性与一致性
++- **Scale**: 1-5
++- **Anchors**：1 = 中断后对话框停在通用错误或永久转圈、结果未知；3 = 能恢复终态但过程无提示或偶发重复/缺失步骤；5 = 中断即刻显示"正在恢复结果"，恢复后步骤完整不重复、终态与正常路径渲染一致，过期则显示明确不可恢复文案
++- **Pass Threshold**: >= 4
++- **Evidence**：浏览器断网/丢响应演练记录与前端代码走查
++
++### AC-12: 设计与实现的一致性、简洁性与最小侵入
++- **Type**: `rubric`
++- **Dimension**：抽象统一性与调用点迁移质量
++- **Scale**: 1-5
++- **Anchors**：1 = 两条路径出现分叉的进度机制或临时补丁式串流；3 = 抽象统一但调用点模板不一致/存在无操作裸跑的写路径；5 = 两条路径仅经同一操作接口发布步骤，~47 个执行点以同一机械模式迁移，无裸跑、无全局串流回退路径残留（nil 防御除外），无新外部依赖
++- **Pass Threshold**: >= 4
++- **Evidence**：代码走查；`go vet`；全局 grep 证据
++
++### AC-13: 构建与测试门禁
++- **Type**: `rule`
++- **Given**：完整改动
++- **When**：运行 `go build ./...`、`go vet ./...`、`go test ./...`
++- **Then**：全部通过；新增单元测试稳定无 flake；集成测试在已部署 VM 上通过（环境受限时记录为 blocked 并说明）
++- **Pass Condition**：三条命令退出码 0；评审复核测试输出
++- **Evidence**：命令输出归档于 tasks 完成证据与 review.md
++
++## Open Questions
++
++- [x] 跨重启是否持久化操作历史？——本期不做（见 Non-Goals）；若后续需要，可沿 jobs 的 JSON 记录模式扩展，不影响本期接口。
++- [x] 操作 ID 由谁生成？——客户端生成以消除"响应丢失即不可恢复"，服务端对无 ID 客户端兜底生成。
++- [x] 全局 `ansible.progress` 如何处置？——停止发布并移除前端监听；主题名保留以兼容旧连接握手。
++- [ ] 终态保留默认值（200 条 / 1 小时）是否符合运维预期？可在实现评审时调整命名常量，不改接口。
+diff --git a/.trae/specs/operation-tracking/tasks.md b/.trae/specs/operation-tracking/tasks.md
+new file mode 100644
+index 0000000..4543a54
+--- /dev/null
++++ b/.trae/specs/operation-tracking/tasks.md
+@@ -0,0 +1,256 @@
++# 操作标识与可恢复进度 — 实施计划
++
++说明：任务按依赖排序；同一层无依赖的任务可并行委派（T1/T3、T9/T10 中前端部分与后端可并行）。每个任务至少含一个 TR；`rule` 给出可客观判定条件，`rubric` 给出评分锚点。全部任务完成且审查通过前不结束流程。
++
++---
++
++## Task 1: broker 有序回放原语 Journal
++- **Status**: `completed`
++- **Completion Evidence**:
++  - internal/broker/journal.go + journal_test.go；seq 单调、Replay/Subscribe 边界、慢消费者丢弃后重订阅零缺口、step/bytes 双上限淘汰、10k 发布有界、Close 封存、并发安全
++  - `go test ./internal/broker/` 通过
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - 在 `internal/broker` 新增 `journal.go`：通用有序事件原语 `Journal`，与现有 Broker 同风格（互斥锁、非阻塞投递、满则关闭慢消费者）。
++  - API 形态：`NewJournal(stepCap int, bytesCap int) *Journal`；`Publish(data any) (Event, error)` 分配进程内单调 seq（Journal 实例内从 1 起）；`Replay(afterSeq int64) (events []Event, latest int64)` 返回 afterSeq 之后的保留事件；`Subscribe(afterSeq int64) (initial []Event, ch chan Event, latest int64)` 返回回放事件+实时通道；慢消费者（缓冲 32）写满即关闭并移除，与 Broker 现有策略一致。
++  - 环形缓冲保留最近 N 条事件与字节上限；被淘汰事件的 seq 仍可由 `OldestSeq()` 查到，供调用方判断"since 早于窗口"。
++  - 终态事件支持 `Close()`/封存：终态写入后不再接受 Publish，订阅者仍可取回放与已关闭通道判定。
++  - 不改动 `broker.go` 任何现有行为（缓存主题零影响）。
++- **Acceptance Criteria Addressed**: AC-4, AC-5, AC-9
++- **Test Requirements**:
++  - `rule` TR-1.1: seq 单调连续；Publish/Replay 边界（after=0 全量、after=latest 空、after 越界）行为确定；证据：`journal_test.go`
++  - `rule` TR-1.2: 慢消费者通道满后被关闭，移除后不影响其他订阅者与发布者；重订阅经 Replay 获得完整序列；证据：`journal_test.go`
++  - `rule` TR-1.3: 超过 stepCap/bytesCap 时旧事件被淘汰、`OldestSeq` 前移、内存不随发布次数增长；证据：`journal_test.go`（发布 10k 事件后断言长度有界）
++  - `rule` TR-1.4: 现有 broker 单元测试零改动通过，`go test ./internal/broker/` 退出码 0
++
++## Task 2: operations 操作注册表（状态机、有界历史、幂等接纳）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - internal/operations/{operation.go,manager.go} + manager_test.go：状态机、序号步骤环（500/16KiB）、终态优先级（timeout>failed）、sync.Once 冻结、幂等 Start（created/running/terminal 三态）、tombstone 410、TTL+条数修剪
++  - 10k 操作压测存量恒定（优化 prune O(n²)→sort.Slice 后 23s 降至 0.65s）
++  - `go test ./internal/operations/` 与 `go test -race ./internal/operations/ ./internal/broker/` 通过
++- **Priority**: high
++- **Depends On**: Task 1
++- **Description**:
++  - 新增包 `internal/operations`（`manager.go`、`operation.go`、`manager_test.go`）：
++    - 类型：`Status`（running/succeeded/failed/timeout）、`Step{Seq int64; Name,Status,Msg string}`、`Record`（operation_id/action/target/req_id/status/steps/seq_first/seq_last/error/started_at/finished_at，JSON tag 稳定）。
++    - `Manager`：`Start(proposedID, action, target, reqID string) (*Operation, error)`：proposedID 为空则生成 24hex；非空须匹配 `^op_[0-9a-fA-F-]{36}$`；ID 已存在时返回既有操作与 `ErrAlreadyRunning`/已终态哨兵（供 API 层 409/重放/410 分支），绝不二次执行。
++    - `(*Operation).AddStep(ansible.TaskStep) Step`：截断 msg ≤16KiB，步骤环 ≤500（序号不回收，记录 seq_first/seq_last），经 Journal 发布实时事件；`MarkFailed(err)`/`MarkTimeout(err)` 记录结局（超时优先）；`Finish(httpStatus int)` 幂等冻结终态（sync.Once），发布 finished 事件并封存 Journal，按 200 条 + 1 小时 TTL 修剪终态记录，淘汰 ID 写入 ≤256 的 tombstone 环。
++    - `Get(id)`：running/终态返回记录；tombstone 命中返回 `ErrExpired`；形态非法/未知返回 `ErrNotFound`。
++    - `Subscribe(id, afterSeq)` 与 Journal 对接（供 SSE handler）。
++  - 常量集中定义（500/16KiB/200/1h/256/缓冲 32）。
++  - 线程安全；不依赖外部进程；不引入磁盘持久化。
++- **Acceptance Criteria Addressed**: AC-2, AC-6, AC-7, AC-9
++- **Test Requirements**:
++  - `rule` TR-2.1: 并发 Start 同一 proposedID 只产生一个操作、AddStep 只执行一次（用回调计数模拟执行）；冲突分类（running→409 哨兵、terminal→终态哨兵、tombstone→ErrExpired、坏 ID→校验错误）正确；证据：`manager_test.go`
++  - `rule` TR-2.2: 步骤 seq 连续；超 500 条/超 16KiB 截断后 seq_first/seq_last 与环内容正确；证据：`manager_test.go`
++  - `rule` TR-2.3: Finish 幂等；timeout 标记优先于 failed；终态字段完整（error/steps/时间戳）；证据：`manager_test.go`
++  - `rule` TR-2.4: 注入 10,000 个终态操作，存活记录 ≤200；tombstone ≤256；TTL（注入可控时钟或短常量测试实例）过期返回 ErrExpired；证据：`manager_test.go`
++  - `rule` TR-2.5: Subscribe 回放+实时衔接无缺口（与 Journal 联测），终态后订阅能立即取到 finished/终态 snapshot
++
++## Task 3: 执行器超时哨兵错误
++- **Status**: `completed`
++- **Completion Evidence**:
++  - ansible.ErrTimedOut（timeoutError 包装，保留 playbook/时长）与 ops.ErrTimedOut（runStep DeadlineExceeded 优先分类，Run 经 errors.Join 保留 %w 链）
++  - runner_test.go 用 PATH 注入假 ansible-playbook（sleep）验证真实超时分类，无外部依赖；ops_test.go sleep 20ms 验证 errors.Is，普通失败不命中哨兵
++  - `go test ./internal/ops/ ./internal/ansible/` 通过
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - `internal/ansible/runner.go`：新增 `var ErrTimedOut = errors.New("ansible playbook timed out")`；DeadlineExceeded 分支返回 `fmt.Errorf("%w: playbook %s after %s", ErrTimedOut, playbook, r.Timeout)`（保留现有文案信息）。
++  - `internal/ops/ops.go`：单步 DeadlineExceeded 时返回包装 `ops.ErrTimedOut` 的错误（新增同名哨兵），其余错误路径不变。
++  - 两个错误均支持 `errors.Is`；不改变退出码、metrics 记录、span 行为。
++- **Acceptance Criteria Addressed**: AC-2, AC-6
++- **Test Requirements**:
++  - `rule` TR-3.1: `errors.Is(err, ansible.ErrTimedOut)` / `errors.Is(err, ops.ErrTimedOut)` 在超时时成立，普通失败不成立；证据：两包新增/现有测试（用极短 Timeout 与 `exec.Command("true")`/慢命令 stub，不依赖 ansible 本体：ops 可直接用 `sleep`；ansible 侧用假 playbookPath 不可行——以错误分支纯函数化或接口抽离方式测试分类逻辑，确保 `go test` 无外部依赖）
++  - `rule` TR-3.2: 错误文本仍包含 playbook/步骤名与超时时长；证据：测试断言
++
++## Task 4: API 接线——beginOperation 助手与 runOp/runLocal 操作感知
++- **Status**: `completed`
++- **Completion Evidence**:
++  - Handler 持有 opMgr；beginOperation(w,r,action,target) 返回包装 writer（sync.Once 终态冻结、断连写失败仍 Complete）+ctx，幂等重放 409/200/500/410；runOp/runLocal 经 ctx 操作记录步骤与结局（超时哨兵分类），无 op 时保留旧全局主题回退
++  - NewHandler 加参，main.go 装配 DefaultConfig 管理器；audit 自动带 op_id
++  - httptest 生命周期测试：成功/失败/超时/运行中 409/非法 ID/过期 410/断连终态可查/SSE snapshot+since+live tail/审计 op_id+req_id 关联，全部通过
++- **Priority**: high
++- **Depends On**: Task 2, Task 3
++- **Description**:
++  - `internal/api/handlers.go`：`Handler` 增加 `opMgr *operations.Manager`；`NewHandler` 增加该参数（同步更新 `main.go` 装配与所有构造点）。
++  - 新增 `beginOperation(w, r, action, target) *http.Request`：校验后调用点使用 `r = h.beginOperation(w, r, action, target)`；内部完成：Start（取请求头 `X-Operation-ID`，400 响应非法 ID）、立即设置响应头 `X-Operation-ID`、把 op 放入 ctx、用 `opResponseWriter` 包装 w（首次 WriteHeader/Write 时按记录的 HTTP 状态与执行器标记结局调用 `Finish`，断连导致写失败同样完成 Finalize）。
++  - `runOp`/`runLocal` 从 ctx 取 op：有 op 时步骤写 `op.AddStep`（不再向全局 `ansible.progress` 发布），结束时 `MarkFailed/MarkTimeout/成功不标记`；ctx 无 op 的防御性回退保留现有 PublishNoCache 行为（仅供未预期调用路径，注释标注迁移后不应出现）。
++  - 包装器须正确透传 `http.Flusher`（SSE 包装器另算，本包装器用于变更响应）与 `http.Hijacker`（如需要）。
++  - `auditLog` 从 ctx 提取 op_id 并加入既有审计行参数（行格式不变、仅增字段）。
++  - 幂等重放分支在 beginOperation 内处理：running→409 `{error,operation_id,status:"running"}`；终态→按记录重放 200/500 规范 JSON（成功 `{operation_id,status,tasks}`；失败/超时 apiError 形态+头）；tombstone→410 `{error:"operation expired",recoverable:false,operation_id}`；重放分支直接短路，不进入 handler 业务。
++- **Acceptance Criteria Addressed**: AC-1, AC-2, AC-6, AC-7, AC-8, AC-10
++- **Test Requirements**:
++  - `rule` TR-4.1: `httptest` 级测试（包内，注入伪造执行器：给 Handler 增加仅测试使用的执行缝，例如包内变量/接口字段）验证：带 X-Operation-ID 的请求响应头回显同 ID；重复 ID 运行中得 409、终态得同结果重放、不二次执行（执行计数=1）；证据：`internal/api/operations_lifecycle_test.go`
++  - `rule` TR-4.2: 客户端断连（取消请求 ctx 后丢弃响应写入）执行仍完成、操作终态可查；超时错误映射 timeout；证据：同上
++  - `rule` TR-4.3: 不带 op 的路径不回归（回退分支单测）；audit 行在注入的 slog 测试 handler 中含 op_id+req_id
++  - `rule` TR-4.4: 非法 X-Operation-ID 返回 400 且无操作建立
++  - `rubric` TR-4.5: 接线抽象简洁性；scale 1-5；锚点 1=runOp/runLocal 出现双轨分叉/handler 自行管终态；3=统一但 begin 模板不一；5=两路径仅经 op 接口发布、终态由包装器单点冻结；threshold >=4；证据：代码走查
++
++## Task 5: 迁移全部 47 个执行点到 beginOperation
++- **Status**: `completed`
++- **Completion Evidence**:
++  - 52 个 runOp/runLocal 执行点全部在通过校验后、执行前以统一模板 beginOperation（12 文件；tls gencert/acme、smb init 的二次 playbook 经 ctx 共享同一操作，applyConfig 辅助函数由 5 个调用方透传）
++  - action/target 与同函数 auditLog 完全对齐；脚本锚点全部 count==1 唯一校验
++  - `go build ./... && go vet ./... && go test ./...` 全绿；函数级扫描确认除 applyConfig 外无裸跑路径
++- **Priority**: high
++- **Depends On**: Task 4
++- **Description**:
++  - 对 12 个 handler 文件中每个 runOp/runLocal 执行点，在**全部校验通过之后、首次执行之前**机械插入：
++    `r = h.beginOperation(w, r, "<action>", "<target>")`
++    action/target 与同函数内 `auditLog` 的 action/target 字符串保持一致（auditLog 调用点本身不改）。
++  - 覆盖文件：zfs_handlers.go、user_handlers.go、smb_handlers.go（含 applyConfig 间接路径与 initSamba 双 playbook）、tls_handlers.go（双 playbook 请求）、pool_handlers.go、acl_handlers.go、auth_handlers.go、autosnap_handlers.go、device_handlers.go、iscsi_handlers.go、service_handlers.go，以及 zfs_handlers 中 scrub/autosnap/chown/batch 等全部点。
++  - 不改变任何执行顺序、锁顺序、缓存失效调用（如 publishDatasets）与响应内容。
++  - 完成后 grep 证明：不存在"调用 runOp/runLocal 但同函数无 beginOperation"的路径（applyConfig 等被 begin 之后调用的辅助函数除外，靠 r.ctx 透传）。
++- **Acceptance Criteria Addressed**: AC-2, AC-8, AC-12
++- **Test Requirements**:
++  - `rule` TR-5.1: `go build ./... && go vet ./...` 通过；对每个执行点 grep 复核 beginOperation 先行；证据：grep 输出归档
++  - `rule` TR-5.2: 代表性端点（createDataset/setDatasetProps、createUser、setSMBShare、initSamba、tlsAcmeIssue、startScrub、createPool、setACLEntry、mutateService）在集成测试中单操作步骤完整、双 playbook 请求步骤序号连续；证据：集成测试
++  - `rule` TR-5.3: 校验失败（400/404/409）响应不带 X-Operation-ID；证据：集成/HTTP 测试
++  - `rubric` TR-5.4: 迁移一致性（模板统一、无裸跑、无顺手改动业务逻辑）；scale 1-5；threshold >=4；证据：diff 走查
++
++## Task 6: 操作查询与 SSE 端点
++- **Status**: `completed`
++- **Completion Evidence**:
++  - GET /api/operations/{id}（400/404/410 分支）与 GET /api/operations/{id}/events（Last-Event-ID/?since、snapshot/step/finished 协议、30s 心跳、慢消费者断流触发重连、终态即释放）
++  - httptest 覆盖终态 snapshot、since 精确增量、越界 snapshot、坏 since 400、运行中 live tail；全部通过
++  - **R2 修复**：窗口判定改用 journal.OldestSeq()（REV-1）；先 Subscribe 后 Snapshot + snapshot 模式去重（REV-2）；lookup 非法 ID 改 404（REV-5）；finished 前非阻塞排空缓冲步（R2-N3）；新增字节窗口回归测试与非法 ID 404 测试
++- **Priority**: high
++- **Depends On**: Task 4
++- **Description**:
++  - 新增 `internal/api/operations_handlers.go`：
++    - `GET /api/operations/{id}`：JSON Record；ErrNotFound→404，ErrExpired→410 规范不可恢复体。
++    - `GET /api/operations/{id}/events`：SSE；注册路由；解析 `Last-Event-ID` 头与 `?since=`（整数，非法→400）；先取 Record：未知/过期在写 SSE 头之前分别 404/410 JSON。
++    - 事件协议（均带 `id: <seq>` 行，seq 无步骤时为 0）：连接即发 `event: op.snapshot`（完整 Record）；之后实时 `event: op.step`（step JSON）；终态 `event: op.finished`（`{status,error}`）；订阅起点晚于窗口时先发 snapshot；since 精确位置则只发增量。
++    - 复用现有 getEvents 的 fan-in/心跳（30s `: keepalive`）/Flusher 模式；慢消费者通道关闭即结束响应让 EventSource 重连；终态 snapshot 后客户端关闭、服务端在 finished 发送后结束响应。
++  - 路由注册进 `RegisterRoutes`；更新 broker `ValidTopics` 无需改动（独立端点不走 /api/events）。
++- **Acceptance Criteria Addressed**: AC-3, AC-4, AC-5, AC-6, AC-7
++- **Test Requirements**:
++  - `rule` TR-6.1: httptest SSE 测试：订阅 running 操作收到 snapshot→steps→finished；since 精确回放仅增量；since 越界先 snapshot；404/410 在响应头前返回 JSON；证据：`operations_handlers_test.go`
++  - `rule` TR-6.2: 慢消费者断开后重新 Subscribe 序列完整无重复（联测 Journal）；证据：同测试
++  - `rule` TR-6.3: 鉴权：未认证请求被现有中间件重定向/拒绝（与其他 /api 路由一致）；证据：中间件既有行为+路由位置走查
++  - `rubric` TR-6.4: 协议简洁性（事件类型最少、snapshot 全量替换消除乱序/重复边界）；scale 1-5；threshold >=4；证据：走查
++
++## Task 7: 操作日志线与审计关联
++- **Status**: `completed`
++- **Completion Evidence**:
++  - operation accepted/finished（info）、step（debug，仅 name/status 不记 msg/敏感值）日志键齐全；audit 行经 ctx 自动追加 op_id
++  - TestAuditLineCarriesOpAndReqID 捕获 slog 输出断言 op_id 与 req_id 同现
++- **Priority**: medium
++- **Depends On**: Task 4
++- **Description**:
++  - Manager/Handler 关键路径日志：`operation accepted`（op_id、req_id、action、target）、AddStep debug 行（op_id、seq、name、status；不记 msg 全文，避免敏感输出，msg 可经查询获取）、`operation finished`（op_id、status、duration_ms、error 存在与否）。
++  - 既有 audit 行携带 op_id（Task 4 接线），确认请求行 req_id 关联说明成立。
++  - 日志键名在代码中集中常量，风格对齐现有 slog 用法。
++- **Acceptance Criteria Addressed**: AC-10
++- **Test Requirements**:
++  - `rule` TR-7.1: 使用 slog 测试 handler 捕获一次完整操作，断言 accepted/step(debug)/finished 三类行 op_id 一致，audit 行同时含 op_id 与 req_id；证据：`internal/api` 或 `internal/operations` 日志测试
++  - `rule` TR-7.2: 步骤日志不含 extra-vars 值与密码字段（只含 name/status）；证据：测试与代码走查
++
++## Task 8: Prometheus 操作指标
++- **Status**: `completed`
++- **Completion Evidence**:
++  - internal/operations/metrics.go：dumpstore_operations_accepted_total、finished_total{status 三枚举}、running gauge，接入 /metrics
++  - TestOperationMetricsEmitted 断言三类指标文本正确
++- **Priority**: medium
++- **Depends On**: Task 2, Task 4
++- **Description**:
++  - 参照 `internal/ansible/metrics.go` 风格新增操作指标（可置于 operations 包或 api metrics 汇总处）：`dumpstore_operations_accepted_total`、`dumpstore_operations_finished_total{status}`（succeeded/failed/timeout）、`dumpstore_operations_running` gauge；接入现有 `/metrics` 输出（与 ansible 指标同一写出路径）。
++- **Acceptance Criteria Addressed**: FR-16（支撑 AC-13 可观测质量）
++- **Test Requirements**:
++  - `rule` TR-8.1: 执行若干成功/失败/超时操作后 `/metrics` 文本含三类指标且计数正确；证据：metrics 文本断言测试
++  - `rule` TR-8.2: 指标基数有界（status 标签仅三个枚举值）；证据：走查
++
++## Task 9: 前端操作生命周期（api() 内置、按操作订阅、断线恢复）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - utils.js：api() 对变更请求生成 op_<UUID>（非安全上下文 getRandomValues/Math.random 兜底）、X-Operation-ID 双向传递；按 op 独立 EventSource（snapshot 全量替换、step seq 去重、404/断流自重建退避、finished/410 关闭）；fetch 无响应时进入 recoverOperation（2s 轮询、410/连续 404/65min 三类明确不可恢复），终态以现有 resolve{tasks}/reject(Error+tasks) 形状回到 65 个调用点，零调用点改动
++  - 步骤渲染抽出 stepHTML；renderRunningSteps 支持"连接中断，正在恢复结果…"；jobs/replication/send/rewrite 车道显式跳过跟踪
++  - node --check 通过；浏览器真实演练：请求/响应头一致、事件流 opId 一致、终态渲染正确
++- **Priority**: high
++- **Depends On**: Task 6
++- **Description**:
++  - `static/js/utils.js`：
++    - 变更类请求（POST/PUT/PATCH/DELETE）在 `api()` 内生成 `op_${crypto.randomUUID()}` 并发送 `X-Operation-ID`；从响应头读回规范 ID；返回值/异常形状保持现状（调用方零改动）。
++    - 新增按操作的 EventSource 管理（同 ID 单实例、终态/410 关闭）：订阅 `/api/operations/{id}/events`；`op.snapshot` 全量替换运行中对话框步骤；`op.step` 按 seq 去重追加（对话框仍须处于 running 状态且绑定 ID 匹配）；`op.finished` 关闭 ES。
++    - 抽出步骤渲染片段供 snapshot 与最终 showOpLog 复用（沿用现有 stepIcons/DOM 结构与 esc 转义）。
++    - fetch 网络级失败（无响应）：不抛给调用方终态错误，进入恢复——对话框显示"连接中断，正在恢复结果…"指示（复用现有样式，必要时加一个 class），轮询 GET 操作（2s 间隔、上限随操作 TTL）并保持 SSE 重连；终态成功→以 `{tasks}` 正常 resolve；失败/超时→以现有 Error（含 tasks/message）reject；410→reject 明确不可恢复文案（带 `expired:true`），由调用方现有 catch 渲染为红色错误条。
++    - HTTP 4xx/5xx（收到响应）路径完全保持现状（响应体即终态，ES 仅用于实时步骤）。
++  - 不引入构建步骤/依赖；遵守事件委托与 esc 约定。
++- **Acceptance Criteria Addressed**: AC-1, AC-3, AC-4, AC-7, AC-8, AC-11
++- **Test Requirements**:
++  - `rule` TR-9.1: 代码走查 + 浏览器演练：两个标签页并发变更对话框零串流；snapshot 替换不产生重复步骤；seq 去重对重复事件有效
++  - `rule` TR-9.2: 模拟 fetch reject（DevTools offline/接口拦截）后恢复终态渲染与正常路径一致；410 显示不可恢复文案且不会无限轮询
++  - `rule` TR-9.3: 65 个现有变更调用点零修改通过（grep 计数与手工冒烟）；成功 toast/失败错误条行为不变
++  - `rubric` TR-9.4: 恢复体验（AC-11 同维）；scale 1-5；threshold >=4；证据：演练记录
++
++## Task 10: 移除全局 ansible.progress 监听并保持 jobs.update
++- **Status**: `completed`
++- **Completion Evidence**:
++  - loader.js 全局 SSE topics 与 ansible.progress 监听移除；jobs.update 与缓存主题映射逐行未动；app.js safety-net 注释校正为仅指缓存主题
++  - grep 证据：前端无 ansible.progress 监听；后端无该主题发布（仅 ValidTopics 与 broker 历史测试保留名称）；浏览器 Network 实测 topics 串含 jobs.update、不含 ansible.progress
++- **Priority**: high
++- **Depends On**: Task 9
++- **Description**:
++  - `static/js/loader.js`：删除 `ansible.progress` 主题订阅与对应监听器；topics 列表移除该项；`jobs.update` 监听与 mergeJob 逻辑、其余缓存主题映射零改动。
++  - 后端在全部执行点迁移完成后不再有 ansible.progress 发布者（ValidTopics 保留名称）；删除/更新引用该主题的过期注释（app.js 中"safety-net"注释若涉及 broker 丢消息，按新机制校正措辞）。
++- **Acceptance Criteria Addressed**: AC-3, AC-8
++- **Test Requirements**:
++  - `rule` TR-10.1: grep 证明前端无 ansible.progress 监听、后端无该主题发布（broker 测试中既有引用保留）；jobs.update 监听与处理代码逐行无改动；证据：grep + diff
++  - `rule` TR-10.2: 冒烟：缓存主题实时刷新与 jobs 页面更新行为不变；证据：dev 模式浏览器验证
++
++## Task 11: 文档同步
++- **Status**: `completed`
++- **Completion Evidence**:
++  - wiki/API-Reference.md：Operations 章节（头、409/200/500/410/400 重放表、record JSON、SSE 事件协议/Last-Event-ID、有界参数、指标名）+ 总览表两行
++  - wiki/Architecture.md：执行车道节新增 Accepted-change operations（标识/统一终态/Journal 回放/有界/关联）与更新后的请求流图
++  - docs/index.html：新增 Tracked, recoverable operations 特性卡；check-docs 的"代码改→文档改"条件满足
++- **Priority**: medium
++- **Depends On**: Task 6
++- **Description**:
++  - 更新 `wiki/API-Reference.md`：新增 "Operations" 章节（X-Operation-ID 请求/响应头、幂等重放 409/410、GET record、SSE 事件协议与 Last-Event-ID/since、有界保留默认值、410 语义）。
++  - 更新 `wiki/Architecture.md`：四条执行车道语境下操作注册表单的位置（接纳→步骤序号→终态→有界淘汰）、与 jobs 通道、broker 缓存主题的边界。
++  - 若 `docs/index.html` 列有端点/特性清单，同步条目；否则不动。
++- **Acceptance Criteria Addressed**: AC-1（接口对外契约可查）
++- **Test Requirements**:
++  - `rule` TR-11.1: 文档描述与实际路由、状态码、事件名、JSON 字段逐一一致；证据：审查比对
++  - `rule` TR-11.2: `make` 文档检查（`.github/workflows/check-docs.yml` 所执行内容）通过
++
++## Task 12: 端到端集成测试
++- **Status**: `completed`
++- **Completion Evidence**:
++  - tests/integration/operations_test.go（9 用例）：头与记录、失败终态、校验拒绝无操作、幂等重放记录冻结、410（201 次廉价 scrub 终态淘汰）、snapshot/Last-Event-ID 续传、双流隔离、断连后台完成、jobs 通道回归
++  - `go vet -tags integration` 编译通过；本机无 limactl/VM，真实运行在独立审查中记为 blocked（不以 blocked 冒充通过）
++- **Priority**: medium
++- **Depends On**: Task 5, Task 9, Task 10
++- **Description**:
++  - 新增 `tests/integration/operations_test.go`（build tag integration，沿用 harness）：
++    1. 成功/失败变更响应均含 X-Operation-ID，GET record 终态字段正确；
++    2. 并发两操作各自 SSE 流零交叉（AC-3）；
++    3. SSE 中途断开以 Last-Event-ID 重连，步骤完整且无重复（AC-4/AC-5）；
++    4. POST 后立即断连（取消 context/关闭连接），轮询 GET 得确定终态（AC-6）；同 ID 重放不产生第二次副作用（如重复 create 返回同终态且目标仅一个）；
++    5. 400 无操作头；jobs 与缓存主题行为回归断言（最小）。
++  - 超时场景（5 分钟）不在 VM 测试中等待；由 Task 3 单测保证分类。
++- **Acceptance Criteria Addressed**: AC-1, AC-3, AC-4, AC-5, AC-6, AC-8, AC-13
++- **Test Requirements**:
++  - `rule` TR-12.1: `go test -tags integration -count=1 -timeout 30m -v ./tests/integration/...` 在已部署 Linux VM 全绿；环境不具备时由独立审查记录 blocked 原因，不以 blocked 冒充通过
++  - `rule` TR-12.2: 用例断言以服务端真实状态（数据集/快照存在性、步骤 seq 集合）为准，不仅看 HTTP 状态
++
++## Task 13: 全量门禁与 stub 模式冒烟
++- **Status**: `completed`
++- **Completion Evidence**:
++  - `go build ./...`、`go vet ./...`、`go test ./...` 全部通过（15 包）；`go test -race ./internal/broker ./internal/operations ./internal/api` 无竞争
++  - 改动包 gofmt 干净（gofmt -l 列出的 login.go/main.go 等为存量格式问题，与本次改动无关，未制造新差异）
++  - stub 模式真实浏览器冒烟全 PASS（含双 playbook 同一操作 seq 1-2、MutationObserver 跨标签零串流、Network 头/事件协议核验、jobs 页回归）
++  - rubric 自评：TR-9.4 恢复体验 5/5（协议齐备+真实演练）；TR-13.2 表现保真 5/5（正常路径无感）
++- **Priority**: high
++- **Depends On**: Task 1–12
++- **Description**:
++  - 运行 `go build ./...`、`go vet ./...`、`go test ./...` 三连门禁；`make dev` stub 模式浏览器冒烟：单窗口一次成功+一次失败变更（实时步骤、最终渲染、toast/错误条）、双标签页并发隔离、DevTools offline 恢复、jobs 页面与 60s safety-net 刷新正常。
++  - 审查 `go vet`、竞态：关键并发包额外跑一次 `go test -race ./internal/broker ./internal/operations ./internal/api`。
++- **Acceptance Criteria Addressed**: AC-8, AC-11, AC-12, AC-13
++- **Test Requirements**:
++  - `rule` TR-13.1: 三命令退出码 0；`-race` 无数据竞争；输出归档为完成证据
++  - `rubric` TR-13.2: 冒烟覆盖度与表现保真；scale 1-5；锚点 1=与现状有可感差异；3=功能正确但视觉/交互有偏差；5=正常路径无感、异常路径可解释；threshold >=4；证据：冒烟记录（步骤+观察）
+diff --git a/AGENTS.md b/AGENTS.md
+index 1c51f7e..e89eb7f 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -39,7 +39,7 @@ Sub-features for managed services (shares, home dirs, Time Machine targets) are
+ 3. **Config-file / OS-resource writes**: `ansible-playbook` with ndjson callback (config-rendering services: SMB users, TLS certs, ACLs, dataset property playbooks). Python dependency required only for this lane.
+ 4. **Long-running data-plane** (`internal/jobs`): background process groups via `exec.Command` — `zfs send \| recv`, `zfs rewrite` (hours-long, 202 + polling).
+ 
+-Both write lanes report the same `tasks: [...]` step shape and stream live progress over the `ansible.progress` SSE topic.
++Both write lanes report the same `tasks: [...]` step shape. Every accepted change in these two lanes is wrapped by an `internal/operations` operation: stable client-generated ID (`X-Operation-ID`), one gapless step sequence, one terminal state (`succeeded`/`failed`/`timeout`), and per-operation resumable SSE (`GET /api/operations/{id}/events`) with bounded history. Do not publish operation progress on the cache-topic broker — the retired global `ansible.progress` topic has no publishers. The jobs lane is separate and keeps its own records/topic.
+ 
+ ## Build & install
+ 
+diff --git a/CLAUDE.md b/CLAUDE.md
+index d293746..ea8a3ee 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -122,7 +122,7 @@ Do not add partial-ownership patterns (block-patching, lineinfile into a shared
+ `zpool`/`zfs` CLI commands are called directly via `exec.Command` for low latency. No Ansible for reads.
+ 
+ **Single-command writes → `internal/ops` (direct exec)**
+-Mutations that are just "assert inputs, run one argv command" — `zpool scrub/replace/offline/online/add/remove/create/import/export`, `zfs snapshot/destroy/clone`, `zfs set userquota@` — run in-process via `internal/ops`. Argv-based, no shell, no Python startup. Input validation lives in the Go handlers (single source; the old playbook asserts were duplicates). Step results use the `ansible.TaskStep` shape and publish to the same `ansible.progress` SSE topic, so the frontend op-log is identical for both write paths.
++Mutations that are just "assert inputs, run one argv command" — `zpool scrub/replace/offline/online/add/remove/create/import/export`, `zfs snapshot/destroy/clone`, `zfs set userquota@` — run in-process via `internal/ops`. Argv-based, no shell, no Python startup. Input validation lives in the Go handlers (single source; the old playbook asserts were duplicates). Step results use the `ansible.TaskStep` shape and are appended to the request's tracked `internal/operations` record (one gapless sequence, one terminal state, per-operation resumable SSE at `/api/operations/{id}/events`), so the frontend op-log is identical for both write paths; do not publish progress on the retired `ansible.progress` topic.
+ 
+ **Configuration writes → Ansible playbooks**
+ Idempotent mutations of config files, service state, and OS-managed resources (smb.conf, useradd, dataset property playbooks, ACLs) go through `ansible-playbook` with `ANSIBLE_STDOUT_CALLBACK=ndjson` (custom callback plugin at `playbooks/callback_plugins/ndjson.py`). The runner in `internal/ansible/runner.go` parses the ndjson output to extract task results.
+diff --git a/README.md b/README.md
+index 2ba7507..3721b19 100644
+--- a/README.md
++++ b/README.md
+@@ -220,7 +220,7 @@ Sub-features (shares, home dirs, Time Machine targets) are gated behind an **ini
+ | **Config-file / OS-resource writes** | `exec.Command(ansible-playbook)` | smb.conf rendering, users/groups, TLS, ACLs, dataset property playbooks — where idempotent orchestration earns its keep |
+ | **Long-running data-plane** | `internal/jobs` — background process groups | `zfs send \| recv`, `zfs rewrite` — hours-long, 202 + job polling |
+ 
+-Both write lanes report the same `tasks: [...]` step shape and stream live progress over the `ansible.progress` SSE topic, so the op-log dialog in the UI is identical regardless of lane. Ansible (and its Python dependency) is required only for the config-file / OS-resource features.
++Both write lanes report the same `tasks: [...]` step shape and append their steps to one accepted-change **operation** (`internal/operations`): a stable, client-generated operation ID, gapless step sequence and a single terminal state (`succeeded`/`failed`/`timeout`), streamed on a per-tab resumable SSE channel (`/api/operations/{id}/events`, replayable via `Last-Event-ID`) so the op-log dialog is identical regardless of lane, tabs never mix progress, and a lost response is resolved by ID instead of showing an "unknown" result. Ansible (and its Python dependency) is required only for the config-file / OS-resource features.
+ 
+ ### Request flow for a write operation
+ 
+@@ -235,7 +235,7 @@ zfs_handlers.go: createSnapshot()
+ internal/ops: Run(steps)          ← in-process, no shell, no Python
+   │  exec zfs snapshot tank/data@bkp
+   │  step result → ansible.TaskStep{name, status, msg}
+-  │  each step → ansible.progress SSE topic (live op-log)
++  │  each step → operation.AddStep (seq) → per-operation SSE (live op-log)
+   ▼
+ handlers.go: return 201 {"snapshot":"tank/data@bkp","tasks":[...]}
+   ▼
+diff --git a/docs/index.html b/docs/index.html
+index 628b602..845ce7c 100644
+--- a/docs/index.html
++++ b/docs/index.html
+@@ -642,6 +642,13 @@
+         </div>
+         <p>Start, stop, restart, enable, and disable Samba, NFS, and iSCSI from the Services tab. Live status badges update via SSE every 10 s. Mutations go through Ansible playbooks with full op-log display. Stopping NFS surfaces a client-disconnect warning.</p>
+       </div>
++      <div class="pool-card">
++        <div class="pool-card-header">
++          <span class="pool-name">Tracked, recoverable operations</span>
++          <span class="health-badge badge-blue">op_&lt;uuid&gt;</span>
++        </div>
++        <p>Every accepted change gets a stable operation ID with ordered steps and one deterministic result (<code>succeeded</code>/<code>failed</code>/<code>timeout</code>). Progress streams on a per-tab, resumable SSE channel (<code>Last-Event-ID</code> replay) — tabs never mix steps, a dropped connection fills the gap without duplicates, and a lost response is resolved by ID after reconnect instead of showing “unknown”. Expired operations answer <code>410</code>.</p>
++      </div>
+       <div class="pool-card">
+         <div class="pool-card-header">
+           <span class="pool-name">TLS / HTTPS</span>
+diff --git a/internal/ansible/runner.go b/internal/ansible/runner.go
+index 3df01a7..70f4fad 100644
+--- a/internal/ansible/runner.go
++++ b/internal/ansible/runner.go
+@@ -5,6 +5,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -25,6 +26,17 @@ import (
+ // is installed at startup.
+ var tracer = otel.Tracer("dumpstore")
+ 
++// ErrTimedOut wraps the error returned when a playbook does not finish within
++// the runner's per-playbook timeout. Callers classify the operation terminal
++// state with errors.Is(err, ErrTimedOut).
++var ErrTimedOut = errors.New("ansible playbook timed out")
++
++// timeoutError builds the wrapped sentinel error for a deadline-exceeded run,
++// keeping the playbook name and the configured limit in the message.
++func timeoutError(playbook string, d time.Duration) error {
++	return fmt.Errorf("%w: playbook %s after %s", ErrTimedOut, playbook, d)
++}
++
+ // TaskResult holds the raw result fields from a single Ansible task (used by RunAndGetStdout).
+ type TaskResult struct {
+ 	Stdout      string   `json:"stdout"`
+@@ -61,6 +73,12 @@ func (o *PlaybookOutput) Steps() []TaskStep {
+ 	return o.steps
+ }
+ 
++// NewPlaybookOutput builds a result from steps. It exists so non-runner code
++// (tests, fakes) can construct a result value.
++func NewPlaybookOutput(steps []TaskStep) *PlaybookOutput {
++	return &PlaybookOutput{steps: steps}
++}
++
+ // Runner executes Ansible playbooks.
+ type Runner struct {
+ 	PlaybookDir   string
+@@ -183,7 +201,7 @@ func (r *Runner) runCore(ctx context.Context, playbook string, extraVars map[str
+ 	if ctx.Err() == context.DeadlineExceeded {
+ 		slog.Error("ansible-playbook timed out", "playbook", playbook, "timeout", r.Timeout)
+ 		r.metrics.record(playbookLabel, elapsed, true)
+-		return nil, fmt.Errorf("ansible-playbook %s: timed out after %s", playbook, r.Timeout)
++		return nil, timeoutError(playbook, r.Timeout)
+ 	}
+ 
+ 	out = &PlaybookOutput{steps: steps}
+diff --git a/internal/ansible/runner_test.go b/internal/ansible/runner_test.go
+new file mode 100644
+index 0000000..0c3ef7b
+--- /dev/null
++++ b/internal/ansible/runner_test.go
+@@ -0,0 +1,55 @@
++package ansible
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestTimeoutErrorWrapsSentinel(t *testing.T) {
++	err := timeoutError("zfs_dataset_set.yml", 5*time.Minute)
++	if !errors.Is(err, ErrTimedOut) {
++		t.Fatalf("errors.Is(err, ErrTimedOut) = false; err=%v", err)
++	}
++	msg := err.Error()
++	if !strings.Contains(msg, "zfs_dataset_set.yml") || !strings.Contains(msg, "5m0s") {
++		t.Fatalf("error message lost context: %q", msg)
++	}
++}
++
++// TestRunStreamingTimeoutClassified installs a fake ansible-playbook on PATH
++// (a shell script that sleeps far beyond the runner timeout) and asserts the
++// deadline is reported as ErrTimedOut. The test needs no real Ansible.
++func TestRunStreamingTimeoutClassified(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("POSIX shell helper required")
++	}
++	dir := t.TempDir()
++	script := `#!/bin/sh
++sleep 2
++`
++	path := filepath.Join(dir, "ansible-playbook")
++	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
++
++	r := &Runner{
++		PlaybookDir:   dir,
++		InventoryPath: filepath.Join(dir, "inventory"),
++		Timeout:       50 * time.Millisecond,
++		metrics:       *newAnsibleMetrics(),
++	}
++	_, err := r.RunStreaming(context.Background(), "anything.yml", nil, nil)
++	if err == nil {
++		t.Fatal("expected timeout error, got nil")
++	}
++	if !errors.Is(err, ErrTimedOut) {
++		t.Fatalf("errors.Is(err, ErrTimedOut) = false; err=%v", err)
++	}
++}
+diff --git a/internal/api/acl_handlers.go b/internal/api/acl_handlers.go
+index d1ca81a..347565e 100644
+--- a/internal/api/acl_handlers.go
++++ b/internal/api/acl_handlers.go
+@@ -178,6 +178,10 @@ func (h *Handler) setACLEntry(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "acl.set", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), playbook, vars)
+ 	auditLog(r.Context(), r, "acl.set", name, err)
+ 	if err != nil {
+@@ -296,6 +300,10 @@ func (h *Handler) removeACLEntry(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "acl.remove", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), playbook, vars)
+ 	auditLog(r.Context(), r, "acl.remove", name, err)
+ 	if err != nil {
+diff --git a/internal/api/auth_handlers.go b/internal/api/auth_handlers.go
+index 1141431..6223dcb 100644
+--- a/internal/api/auth_handlers.go
++++ b/internal/api/auth_handlers.go
+@@ -39,6 +39,16 @@ func (h *Handler) changePassword(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusInternalServerError, errors.New("failed to hash password"), nil)
+ 		return
+ 	}
++	// The target username is already known from the current config; read it
++	// under the same lock used later so the operation target matches the
++	// audit line.
++	h.authMu.RLock()
++	existingUsername := h.authCfg.Username
++	h.authMu.RUnlock()
++	w, r, replayed := h.beginOperation(w, r, "auth.change_password", existingUsername)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "auth_set_password.yml", map[string]string{
+ 		"config_path":   h.configPath,
+ 		"password_hash": string(hash),
+@@ -69,6 +79,10 @@ func (h *Handler) changeUsername(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, errors.New("invalid username: use letters, digits, underscores, hyphens, dots; must start with a letter"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "auth.change_username", req.Username)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "auth_set_username.yml", map[string]string{
+ 		"config_path": h.configPath,
+ 		"username":    req.Username,
+diff --git a/internal/api/autosnap_handlers.go b/internal/api/autosnap_handlers.go
+index ee6e9cc..c846f54 100644
+--- a/internal/api/autosnap_handlers.go
++++ b/internal/api/autosnap_handlers.go
+@@ -35,6 +35,10 @@ func (h *Handler) takeoverAutoSnapshot(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusInternalServerError, fmt.Errorf("autosnap runner not initialised"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "auto_snapshot.takeover", "")
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "auto_snapshot_takeover.yml", map[string]string{})
+ 	auditLog(r.Context(), r, "auto_snapshot.takeover", "", err)
+ 	if err != nil {
+@@ -56,6 +60,10 @@ func (h *Handler) releaseAutoSnapshot(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	h.autosnap.Unregister()
++	w, r, replayed := h.beginOperation(w, r, "auto_snapshot.release", "")
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "auto_snapshot_release.yml", map[string]string{})
+ 	auditLog(r.Context(), r, "auto_snapshot.release", "", err)
+ 	if err != nil {
+diff --git a/internal/api/device_handlers.go b/internal/api/device_handlers.go
+index 22bad11..0e1df53 100644
+--- a/internal/api/device_handlers.go
++++ b/internal/api/device_handlers.go
+@@ -58,6 +58,10 @@ func (h *Handler) replaceDevice(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("replacement device must differ from the old device"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "pool.replace_device", pool+" "+req.OldDevice+" -> "+req.NewDevice)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{
+ 		Name: "Replace " + req.OldDevice + " with " + req.NewDevice + " in " + pool,
+ 		Argv: []string{"zpool", "replace", pool, req.OldDevice, req.NewDevice},
+@@ -99,6 +103,10 @@ func (h *Handler) setDeviceState(w http.ResponseWriter, r *http.Request, subcmd,
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid device identifier"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, action, pool+" "+req.Device)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{
+ 		Name: "Take " + req.Device + " " + subcmd + " in " + pool,
+ 		Argv: []string{"zpool", subcmd, pool, req.Device},
+diff --git a/internal/api/handlers.go b/internal/api/handlers.go
+index 6bbfb48..58d7489 100644
+--- a/internal/api/handlers.go
++++ b/internal/api/handlers.go
+@@ -3,6 +3,7 @@ package api
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -18,6 +19,7 @@ import (
+ 	"dumpstore/internal/autosnap"
+ 	"dumpstore/internal/broker"
+ 	"dumpstore/internal/jobs"
++	"dumpstore/internal/operations"
+ 	"dumpstore/internal/ops"
+ 	"dumpstore/internal/replication"
+ 	"dumpstore/internal/schema"
+@@ -194,6 +196,7 @@ type Handler struct {
+ 	version    string
+ 	broker     *broker.Broker
+ 	jobs       *jobs.Manager
++	opMgr      *operations.Manager
+ 	repl       *replication.Runner
+ 	autosnap   *autosnap.Runner
+ 	userMu     sync.Mutex   // serialises user/group write ops to avoid /etc/group lock contention
+@@ -203,22 +206,31 @@ type Handler struct {
+ 	authStore  *auth.SessionStore
+ 	configPath string
+ 	otelInfo   any // effective OTEL status for sysinfo; injected via SetOtelInfo
++
++	// Execution seams; production wiring points at the real runners. Tests
++	// replace them to drive the operation lifecycle without ansible/zfs.
++	execPlaybook func(ctx context.Context, playbook string, vars map[string]string, onStep func(ansible.TaskStep)) (*ansible.PlaybookOutput, error)
++	execLocal    func(ctx context.Context, steps []ops.Step, onStep func(ansible.TaskStep)) (*ops.Result, error)
+ }
+ 
+ // NewHandler creates a Handler with the given dependencies.
+-func NewHandler(runner *ansible.Runner, version string, b *broker.Broker, jm *jobs.Manager, repl *replication.Runner, autosnap *autosnap.Runner, authCfg *auth.Config, authStore *auth.SessionStore, configPath string) *Handler {
+-	return &Handler{
++func NewHandler(runner *ansible.Runner, version string, b *broker.Broker, jm *jobs.Manager, repl *replication.Runner, autosnap *autosnap.Runner, authCfg *auth.Config, authStore *auth.SessionStore, configPath string, opMgr *operations.Manager) *Handler {
++	h := &Handler{
+ 		runner:     runner,
+ 		ops:        ops.NewRunner(),
+ 		version:    version,
+ 		broker:     b,
+ 		jobs:       jm,
++		opMgr:      opMgr,
+ 		repl:       repl,
+ 		autosnap:   autosnap,
+ 		authCfg:    authCfg,
+ 		authStore:  authStore,
+ 		configPath: configPath,
+ 	}
++	h.execPlaybook = h.runner.RunStreaming
++	h.execLocal = h.ops.Run
++	return h
+ }
+ 
+ // AuthCfgRead calls fn while holding the authCfg read lock.
+@@ -236,33 +248,74 @@ func (h *Handler) AuthCfgWrite(fn func(*auth.Config)) {
+ }
+ 
+ // auditLog emits a structured audit log line for every mutating API operation.
+-// req_id is injected automatically by the journalHandler middleware.
+-// Since the service has no authentication, operator identity is the client IP.
++// req_id is injected automatically by the journalHandler middleware and
++// op_id by beginOperation (when the request was accepted as a tracked
++// change). Since the service has no authentication, operator identity is the
++// client IP.
+ func auditLog(ctx context.Context, r *http.Request, action, target string, err error) {
+ 	args := []any{"remote_ip", r.RemoteAddr, "action", action, "target", target, "outcome", "ok"}
+ 	if err != nil {
+ 		args[7] = "err"
+ 		args = append(args, "error", err.Error())
+ 	}
++	if op := operations.FromContext(ctx); op != nil {
++		args = append(args, "op_id", op.ID())
++	}
+ 	slog.InfoContext(ctx, "audit", args...)
+ }
+ 
+-// runOp executes a playbook and publishes each task step to the ansible.progress
+-// SSE topic as it completes, so the frontend can show live progress. ctx is
+-// used for trace-span parenting only; the runner drops its cancellation.
++// markOutcome records an execution lane's result on the operation in ctx.
++// Timeouts take precedence over ordinary failures. No-op without an op.
++func markOutcome(ctx context.Context, err error) {
++	op := operations.FromContext(ctx)
++	if op == nil || err == nil {
++		return
++	}
++	switch {
++	case errors.Is(err, ansible.ErrTimedOut) || errors.Is(err, ops.ErrTimedOut):
++		op.MarkTimeout(err.Error())
++	default:
++		op.MarkFailure(err.Error())
++	}
++}
++
++// runOp executes a playbook. When the request began a tracked operation
++// (beginOperation), each task step is appended to that operation with a
++// gapless sequence and published on the operation's replay stream instead
++// of the legacy global ansible.progress topic — that is what keeps one
++// browser tab's progress out of another tab's dialog. ctx is used for
++// trace-span parenting only; the runner drops its cancellation.
+ func (h *Handler) runOp(ctx context.Context, playbook string, vars map[string]string) (*ansible.PlaybookOutput, error) {
+-	return h.runner.RunStreaming(ctx, playbook, vars, func(step ansible.TaskStep) {
+-		h.broker.PublishNoCache("ansible.progress", step)
++	op := operations.FromContext(ctx)
++	if op == nil {
++		// Defensive fallback: callers must begin an operation before the
++		// first execution. Retain the legacy topic for any un-migrated path.
++		return h.execPlaybook(ctx, playbook, vars, func(step ansible.TaskStep) {
++			h.broker.PublishNoCache("ansible.progress", step)
++		})
++	}
++	out, err := h.execPlaybook(ctx, playbook, vars, func(step ansible.TaskStep) {
++		h.opMgr.AddStep(op, step)
+ 	})
++	markOutcome(ctx, err)
++	return out, err
+ }
+ 
+ // runLocal executes argv steps through the in-process ops layer (#115),
+-// publishing each step to the same ansible.progress SSE topic so the
+-// frontend's live op-log works identically to playbook-backed writes.
++// recording them on the tracked operation exactly like playbook-backed
++// writes so the two lanes share one step stream and one terminal state.
+ func (h *Handler) runLocal(ctx context.Context, steps ...ops.Step) (*ops.Result, error) {
+-	return h.ops.Run(ctx, steps, func(step ansible.TaskStep) {
+-		h.broker.PublishNoCache("ansible.progress", step)
++	op := operations.FromContext(ctx)
++	if op == nil {
++		return h.execLocal(ctx, steps, func(step ansible.TaskStep) {
++			h.broker.PublishNoCache("ansible.progress", step)
++		})
++	}
++	res, err := h.execLocal(ctx, steps, func(step ansible.TaskStep) {
++		h.opMgr.AddStep(op, step)
+ 	})
++	markOutcome(ctx, err)
++	return res, err
+ }
+ 
+ // RegisterRoutes attaches all API routes to mux.
+@@ -302,6 +355,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+ 	mux.HandleFunc("GET /api/jobs/{id}", h.getJob)
+ 	mux.HandleFunc("POST /api/jobs/{id}/cancel", h.cancelJob)
+ 	mux.HandleFunc("DELETE /api/jobs/{id}", h.removeJob)
++	mux.HandleFunc("GET /api/operations/{id}", h.getOperation)
++	mux.HandleFunc("GET /api/operations/{id}/events", h.getOperationEvents)
+ 	mux.HandleFunc("POST /api/snapshots/delete-batch", h.deleteSnapshotBatch)
+ 	mux.HandleFunc("DELETE /api/snapshots/{snapshot...}", h.deleteSnapshot)
+ 	mux.HandleFunc("GET /api/events", h.getEvents)
+diff --git a/internal/api/iscsi_handlers.go b/internal/api/iscsi_handlers.go
+index 0e7e1c7..a885fba 100644
+--- a/internal/api/iscsi_handlers.go
++++ b/internal/api/iscsi_handlers.go
+@@ -109,6 +109,10 @@ func (h *Handler) createISCSITarget(w http.ResponseWriter, r *http.Request) {
+ 		playbook = "iscsi_target_create_freebsd.yml"
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "iscsi.create", req.Zvol)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), playbook, map[string]string{
+ 		"zvol":          req.Zvol,
+ 		"iqn":           req.IQN,
+@@ -152,6 +156,10 @@ func (h *Handler) deleteISCSITarget(w http.ResponseWriter, r *http.Request) {
+ 		playbook = "iscsi_target_delete_freebsd.yml"
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "iscsi.delete", zvol)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), playbook, map[string]string{"iqn": iqn, "zvol": zvol})
+ 	auditLog(r.Context(), r, "iscsi.delete", zvol, err)
+ 	if err != nil {
+diff --git a/internal/api/metrics.go b/internal/api/metrics.go
+index 465d0d4..d310cba 100644
+--- a/internal/api/metrics.go
++++ b/internal/api/metrics.go
+@@ -94,6 +94,7 @@ func (h *Handler) getMetrics(w http.ResponseWriter, _ *http.Request) {
+ 	globalHTTP.emitTo(w)
+ 	h.runner.EmitMetrics(w)
+ 	h.ops.EmitMetrics(w)
++	h.opMgr.EmitMetrics(w)
+ }
+ 
+ func gauge(w http.ResponseWriter, name, help string, val float64) {
+diff --git a/internal/api/operations_handlers.go b/internal/api/operations_handlers.go
+new file mode 100644
+index 0000000..13839bd
+--- /dev/null
++++ b/internal/api/operations_handlers.go
+@@ -0,0 +1,200 @@
++package api
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"dumpstore/internal/operations"
++)
++
++// getOperation handles GET /api/operations/{id}: the deterministic query
++// point for a change accepted earlier — including one whose accepting HTTP
++// connection was lost.
++func (h *Handler) getOperation(w http.ResponseWriter, r *http.Request) {
++	op, err := h.opMgr.Get(r.PathValue("id"))
++	if err != nil {
++		h.writeOperationLookupError(w, r, err)
++		return
++	}
++	writeJSON(r.Context(), w, op.Snapshot())
++}
++
++// getOperationEvents handles GET /api/operations/{id}/events:
++//
++//	Last-Event-ID header or ?since=<n> selects the resume position.
++//	Position before the retained window (or 0) → one op.snapshot full replace.
++//	Position inside the window → only newer op.step events, then op.finished.
++//	A slow consumer whose buffer fills is dropped by the journal; the
++//	response ends and EventSource reconnects with Last-Event-ID, replaying
++//	the gap along the same path.
++func (h *Handler) getOperationEvents(w http.ResponseWriter, r *http.Request) {
++	op, err := h.opMgr.Get(r.PathValue("id"))
++	if err != nil {
++		h.writeOperationLookupError(w, r, err)
++		return
++	}
++
++	since, ok := parseResumePosition(w, r)
++	if !ok {
++		return // 400 already written
++	}
++
++	flusher, ok := w.(http.Flusher)
++	if !ok {
++		writeError(r.Context(), w, http.StatusInternalServerError,
++			errors.New("streaming not supported by this transport"), nil)
++		return
++	}
++
++	// Subscribe BEFORE snapshotting so no step can fall into the gap
++	// between the two reads (see snapshot-mode gating below).
++	journal := op.Journal()
++	initial, ch, _ := journal.Subscribe(since)
++	defer journal.Unsubscribe(ch)
++	rec := op.Snapshot()
++
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-cache")
++	w.Header().Set("Connection", "keep-alive")
++	w.Header().Set("X-Accel-Buffering", "no")
++	w.WriteHeader(http.StatusOK)
++	flusher.Flush()
++
++	// The replay window is the Journal's, not the record ring's: the journal
++	// can byte-evict earlier than the 500-step ring fills. A position older
++	// than its oldest retained event (and every fresh subscriber at 0)
++	// converges via a full op.snapshot; a position inside the journal window
++	// receives only the missing op.step events.
++	snapshotMode := since == 0 || since < journal.OldestSeq()
++	if snapshotMode {
++		writeSSE(flusher, w, rec.SeqLast, "op.snapshot", rec)
++		if rec.Status.Terminal() {
++			// Snapshot already carries the terminal record; the browser
++			// closes the stream here. Release the server side as well.
++			return
++		}
++	} else {
++		for _, ev := range initial {
++			var step operations.Step
++			if err := json.Unmarshal(ev.Data, &step); err != nil {
++				continue
++			}
++			writeSSE(flusher, w, ev.Seq, "op.step", step)
++		}
++		if rec.Status.Terminal() {
++			writeSSE(flusher, w, rec.SeqLast, "op.finished", finishedPayload(rec))
++			return
++		}
++	}
++
++	heartbeat := time.NewTicker(30 * time.Second)
++	defer heartbeat.Stop()
++	done := op.Done()
++
++	for {
++		select {
++		case <-r.Context().Done():
++			return
++		case <-heartbeat.C:
++			fmt.Fprint(w, ": keepalive\n\n")
++			flusher.Flush()
++		case ev, open := <-ch:
++			if !open {
++				// Journal dropped this slow subscriber. Ending the response
++				// makes EventSource reconnect with Last-Event-ID; replay
++				// closes the gap.
++				return
++			}
++			var step operations.Step
++			if err := json.Unmarshal(ev.Data, &step); err != nil {
++				continue
++			}
++			// Snapshot mode may already contain steps that were published
++			// between Subscribe and Snapshot; never send those twice.
++			if snapshotMode && step.Seq <= rec.SeqLast {
++				continue
++			}
++			writeSSE(flusher, w, ev.Seq, "op.step", step)
++		case <-done:
++			// select may choose a ready done while tail steps are still
++			// queued in ch; flush them before finished so a pure-SSE client
++			// that resumes at the finished id has not lost any step.
++			for {
++				select {
++				case ev, open := <-ch:
++					if !open {
++						goto finished
++					}
++					var step operations.Step
++					if err := json.Unmarshal(ev.Data, &step); err == nil &&
++						(!snapshotMode || step.Seq > rec.SeqLast) {
++						writeSSE(flusher, w, ev.Seq, "op.step", step)
++					}
++				default:
++					goto finished
++				}
++			}
++		finished:
++			final := op.Snapshot()
++			writeSSE(flusher, w, final.SeqLast, "op.finished", finishedPayload(final))
++			return
++		}
++	}
++}
++
++// finishedPayload is the op.finished event body.
++type finishedBody struct {
++	Status operations.Status `json:"status"`
++	Error  string            `json:"error,omitempty"`
++}
++
++func finishedPayload(rec operations.Record) finishedBody {
++	return finishedBody{Status: rec.Status, Error: rec.Error}
++}
++
++// writeSSE emits one SSE event with a resumable id line.
++func writeSSE(flusher http.Flusher, w http.ResponseWriter, id int64, event string, payload any) {
++	data, err := json.Marshal(payload)
++	if err != nil {
++		return
++	}
++	fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", id, event, data)
++	flusher.Flush()
++}
++
++// parseResumePosition reads the resume point from ?since= or Last-Event-ID.
++// Since 0 means "no position". Writes 400 and returns ok=false on garbage.
++func parseResumePosition(w http.ResponseWriter, r *http.Request) (int64, bool) {
++	raw := strings.TrimSpace(r.URL.Query().Get("since"))
++	if raw == "" {
++		raw = strings.TrimSpace(r.Header.Get("Last-Event-ID"))
++	}
++	if raw == "" {
++		return 0, true
++	}
++	n, err := strconv.ParseInt(raw, 10, 64)
++	if err != nil || n < 0 {
++		writeError(r.Context(), w, http.StatusBadRequest,
++			errors.New("invalid resume position"), nil)
++		return 0, false
++	}
++	return n, true
++}
++
++// writeOperationLookupError maps registry lookup errors to HTTP responses.
++// Per the operations contract, malformed and unknown IDs are both 404 on a
++// lookup (a malformed *request header* on POST is the 400 case, handled in
++// beginOperation); only expired IDs that once existed answer 410.
++func (h *Handler) writeOperationLookupError(w http.ResponseWriter, r *http.Request, err error) {
++	switch {
++	case errors.Is(err, operations.ErrExpired):
++		writeOperationExpired(w, r.PathValue("id"))
++	default:
++		writeError(r.Context(), w, http.StatusNotFound, err, nil)
++	}
++}
+diff --git a/internal/api/operations_lifecycle_test.go b/internal/api/operations_lifecycle_test.go
+new file mode 100644
+index 0000000..6c139b3
+--- /dev/null
++++ b/internal/api/operations_lifecycle_test.go
+@@ -0,0 +1,523 @@
++package api
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"log/slog"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"dumpstore/internal/ansible"
++	"dumpstore/internal/broker"
++	"dumpstore/internal/operations"
++	"dumpstore/internal/ops"
++)
++
++// fakeExec controls the behaviour of the playbook execution seam in tests.
++type fakeExec struct {
++	mu      sync.Mutex
++	execs   int
++	gate    chan struct{} // non-nil: block until closed
++	fail    bool
++	timeout bool
++	steps   []ansible.TaskStep
++}
++
++func (f *fakeExec) runPlaybook(ctx context.Context, playbook string, vars map[string]string, onStep func(ansible.TaskStep)) (*ansible.PlaybookOutput, error) {
++	f.mu.Lock()
++	f.execs++
++	gate := f.gate
++	fail, timeout := f.fail, f.timeout
++	steps := append([]ansible.TaskStep(nil), f.steps...)
++	f.mu.Unlock()
++
++	if gate != nil {
++		<-gate
++	}
++	for _, s := range steps {
++		onStep(s)
++	}
++	if timeout {
++		return ansible.NewPlaybookOutput(steps), fmt.Errorf("%w: playbook %s after 5m0s", ansible.ErrTimedOut, playbook)
++	}
++	if fail {
++		return ansible.NewPlaybookOutput(steps), fmt.Errorf("task %q failed: boom", "fail task")
++	}
++	return ansible.NewPlaybookOutput(steps), nil
++}
++
++func (f *fakeExec) count() int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.execs
++}
++
++// newOpTestHandler wires a Handler with the operation manager and registers
++// one synthetic mutation route that exercises beginOperation → runOp →
++// writeJSON/writeRunOpError exactly like a real handler.
++func newOpTestHandler(t *testing.T, cfg operations.Config, fx *fakeExec) (*Handler, http.Handler) {
++	t.Helper()
++	h := &Handler{
++		broker: broker.New(),
++		opMgr:  operations.NewManager(cfg),
++	}
++	h.execPlaybook = fx.runPlaybook
++
++	mux := http.NewServeMux()
++	mux.HandleFunc("POST /test-op", func(w http.ResponseWriter, r *http.Request) {
++		// Emulate the request-ID middleware for audit correlation.
++		r = r.WithContext(WithReqID(r.Context(), "req-test-1"))
++		w, r, replayed := h.beginOperation(w, r, "test.op", "target-x")
++		if replayed {
++			return
++		}
++		out, err := h.runOp(r.Context(), "fake.yml", nil)
++		auditLog(r.Context(), r, "test.op", "target-x", err)
++		if err != nil {
++			writeRunOpError(r.Context(), w, err, out)
++			return
++		}
++		writeJSON(r.Context(), w, map[string]any{"tasks": out.Steps()})
++	})
++	h.RegisterRoutes(mux)
++	return h, mux
++}
++
++func defaultFake() *fakeExec {
++	return &fakeExec{steps: []ansible.TaskStep{
++		{Name: "assert", Status: "ok"},
++		{Name: "apply", Status: "changed", Msg: "done"},
++	}}
++}
++
++func doPost(t *testing.T, hnd http.Handler, id string) *httptest.ResponseRecorder {
++	t.Helper()
++	req := httptest.NewRequest("POST", "/test-op", nil)
++	if id != "" {
++		req.Header.Set(OperationIDHeader, id)
++	}
++	rec := httptest.NewRecorder()
++	hnd.ServeHTTP(rec, req)
++	return rec
++}
++
++func TestBeginOperationSuccessLifecycle(t *testing.T) {
++	fx := defaultFake()
++	h, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	id := "op_11111111-1111-1111-1111-111111111111"
++
++	rec := doPost(t, hnd, id)
++	if rec.Code != 200 {
++		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
++	}
++	if rec.Header().Get(OperationIDHeader) != id {
++		t.Fatalf("missing operation header: %q", rec.Header().Get(OperationIDHeader))
++	}
++	var body struct {
++		Tasks []ansible.TaskStep `json:"tasks"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
++		t.Fatal(err)
++	}
++	if len(body.Tasks) != 2 {
++		t.Fatalf("tasks = %d", len(body.Tasks))
++	}
++
++	op, err := h.opMgr.Get(id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := op.Snapshot()
++	if got.Status != operations.StatusSucceeded || got.SeqLast != 2 || got.Action != "test.op" || got.ReqID != "req-test-1" {
++		t.Fatalf("record: %+v", got)
++	}
++	if got.Steps[0].Seq != 1 || got.Steps[1].Seq != 2 {
++		t.Fatalf("seq ordering: %+v", got.Steps)
++	}
++}
++
++func TestBeginOperationFailureReplayNoReexecute(t *testing.T) {
++	fx := defaultFake()
++	fx.fail = true
++	h, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	id := "op_22222222-2222-2222-2222-222222222222"
++
++	rec := doPost(t, hnd, id)
++	if rec.Code != 500 {
++		t.Fatalf("status = %d", rec.Code)
++	}
++	if rec.Header().Get(OperationIDHeader) != id {
++		t.Fatal("operation header missing on failure")
++	}
++
++	op, _ := h.opMgr.Get(id)
++	if op.Snapshot().Status != operations.StatusFailed || op.Snapshot().Error == "" {
++		t.Fatalf("record: %+v", op.Snapshot())
++	}
++
++	// Re-POST the same ID: deterministic terminal replay, no second run.
++	rec2 := doPost(t, hnd, id)
++	if rec2.Code != 500 || !strings.Contains(rec2.Body.String(), "operation_id") {
++		t.Fatalf("replay: %d %s", rec2.Code, rec2.Body.String())
++	}
++	if fx.count() != 1 {
++		t.Fatalf("executed %d times, want 1", fx.count())
++	}
++}
++
++func TestBeginOperationTimeoutClassified(t *testing.T) {
++	fx := defaultFake()
++	fx.timeout = true
++	h, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	id := "op_33333333-3333-3333-3333-333333333333"
++
++	if rec := doPost(t, hnd, id); rec.Code != 500 {
++		t.Fatalf("status = %d", rec.Code)
++	}
++	op, _ := h.opMgr.Get(id)
++	if op.Snapshot().Status != operations.StatusTimeout {
++		t.Fatalf("status = %s, want timeout", op.Snapshot().Status)
++	}
++}
++
++func TestBeginOperationReplayRunning409(t *testing.T) {
++	fx := defaultFake()
++	fx.gate = make(chan struct{})
++	_, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	id := "op_44444444-4444-4444-4444-444444444444"
++
++	firstDone := make(chan *httptest.ResponseRecorder, 1)
++	go func() { firstDone <- doPost(t, hnd, id) }()
++
++	// Wait until the first execution is inside the gate.
++	deadline := time.After(time.Second)
++	for fx.count() == 0 {
++		select {
++		case <-deadline:
++			t.Fatal("first execution never started")
++		default:
++			time.Sleep(time.Millisecond)
++		}
++	}
++
++	rec := doPost(t, hnd, id)
++	if rec.Code != http.StatusConflict {
++		t.Fatalf("running replay status = %d body=%s", rec.Code, rec.Body.String())
++	}
++	if !strings.Contains(rec.Body.String(), `"status":"running"`) {
++		t.Fatalf("409 body: %s", rec.Body.String())
++	}
++
++	close(fx.gate)
++	first := <-firstDone
++	if first.Code != 200 {
++		t.Fatalf("first request: %d", first.Code)
++	}
++	if fx.count() != 1 {
++		t.Fatalf("executed %d times, want 1", fx.count())
++	}
++}
++
++func TestBeginOperationInvalidID(t *testing.T) {
++	fx := defaultFake()
++	_, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	rec := doPost(t, hnd, "not-a-uuid")
++	if rec.Code != 400 {
++		t.Fatalf("status = %d", rec.Code)
++	}
++	if fx.count() != 0 {
++		t.Fatal("no execution must happen for a malformed operation ID")
++	}
++}
++
++func TestBeginOperationExpired410(t *testing.T) {
++	cfg := operations.Config{RetainMax: 1, RetentionTTL: time.Hour, TombstoneMax: 4}
++	fx := defaultFake()
++	h, hnd := newOpTestHandler(t, cfg, fx)
++
++	id1 := "op_55555555-5555-5555-5555-555555555555"
++	if rec := doPost(t, hnd, id1); rec.Code != 200 {
++		t.Fatalf("first: %d", rec.Code)
++	}
++	id2 := "op_66666666-6666-6666-6666-666666666666"
++	if rec := doPost(t, hnd, id2); rec.Code != 200 {
++		t.Fatalf("second: %d", rec.Code)
++	}
++
++	// id1 is now tombstoned (RetainMax=1).
++	if _, err := h.opMgr.Get(id1); err != operations.ErrExpired {
++		t.Fatalf("Get: %v", err)
++	}
++	rec := doPost(t, hnd, id1)
++	if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), `"recoverable":false`) {
++		t.Fatalf("expired replay: %d %s", rec.Code, rec.Body.String())
++	}
++
++	// Direct GET of an expired ID is 410 as well.
++	req := httptest.NewRequest("GET", "/api/operations/"+id1, nil)
++	g := httptest.NewRecorder()
++	hnd.ServeHTTP(g, req)
++	if g.Code != http.StatusGone {
++		t.Fatalf("GET expired: %d", g.Code)
++	}
++	// Unknown valid ID → 404.
++	req = httptest.NewRequest("GET", "/api/operations/op_77777777-7777-7777-7777-777777777777", nil)
++	g = httptest.NewRecorder()
++	hnd.ServeHTTP(g, req)
++	if g.Code != http.StatusNotFound {
++		t.Fatalf("GET unknown: %d", g.Code)
++	}
++}
++
++// failingWriter simulates a client that has gone away: every write fails.
++// The mutation must still reach a queryable terminal state.
++type failingWriter struct {
++	header http.Header
++}
++
++func (f *failingWriter) Header() http.Header { return f.header }
++func (f *failingWriter) Write([]byte) (int, error) {
++	return 0, io.ErrClosedPipe
++}
++func (f *failingWriter) WriteHeader(int) {}
++
++func TestBeginOperationDisconnectedWriterStillFinalizes(t *testing.T) {
++	fx := defaultFake()
++	h, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	id := "op_88888888-8888-8888-8888-888888888888"
++
++	req := httptest.NewRequest("POST", "/test-op", nil)
++	req.Header.Set(OperationIDHeader, id)
++	hnd.ServeHTTP(&failingWriter{header: http.Header{}}, req)
++
++	op, err := h.opMgr.Get(id)
++	if err != nil {
++		t.Fatalf("query after disconnect: %v", err)
++	}
++	if op.Snapshot().Status != operations.StatusSucceeded {
++		t.Fatalf("status = %s", op.Snapshot().Status)
++	}
++}
++
++// TestOperationEventsTerminalSnapshotAndResume verifies the SSE protocol
++// for an already terminal operation.
++func TestOperationEventsTerminal(t *testing.T) {
++	fx := defaultFake()
++	_, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	id := "op_99999999-9999-9999-9999-999999999999"
++	if rec := doPost(t, hnd, id); rec.Code != 200 {
++		t.Fatal(rec.Code)
++	}
++
++	// Fresh subscribe → snapshot, then the handler returns (terminal).
++	req := httptest.NewRequest("GET", "/api/operations/"+id+"/events", nil)
++	rec := httptest.NewRecorder()
++	hnd.ServeHTTP(rec, req)
++	body := rec.Body.String()
++	if !strings.Contains(body, "id: 2") || !strings.Contains(body, "event: op.snapshot") ||
++		!strings.Contains(body, `"operation_id"`) {
++		t.Fatalf("snapshot stream: %q", body)
++	}
++
++	// since=1 → incremental: step seq 2 then finished.
++	req = httptest.NewRequest("GET", "/api/operations/"+id+"/events?since=1", nil)
++	rec = httptest.NewRecorder()
++	hnd.ServeHTTP(rec, req)
++	body = rec.Body.String()
++	if !strings.Contains(body, "id: 2\nevent: op.step") || !strings.Contains(body, "event: op.finished") {
++		t.Fatalf("incremental stream: %q", body)
++	}
++	if strings.Contains(body, "op.snapshot") {
++		t.Fatalf("incremental resume must not resend snapshot: %q", body)
++	}
++
++	// Garbage since → 400.
++	req = httptest.NewRequest("GET", "/api/operations/"+id+"/events?since=abc", nil)
++	rec = httptest.NewRecorder()
++	hnd.ServeHTTP(rec, req)
++	if rec.Code != 400 {
++		t.Fatalf("bad since: %d", rec.Code)
++	}
++}
++
++// TestOperationEventsLiveTail verifies snapshot → live op.step → finished
++// for an operation that is still running when the stream connects.
++func TestOperationEventsLiveTail(t *testing.T) {
++	fx := defaultFake()
++	h, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	srv := httptest.NewServer(hnd)
++	defer srv.Close()
++
++	id := "op_abababab-abab-abab-abab-abababababab"
++	op, outcome, err := h.opMgr.Start(id, "test.op", "live", "req-live")
++	if err != nil || outcome != operations.StartCreated {
++		t.Fatalf("start: %v %v", err, outcome)
++	}
++
++	resp, err := http.Get(srv.URL + "/api/operations/" + id + "/events")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	reader := bufio.NewReader(resp.Body)
++	readLine := func() string {
++		line, err := reader.ReadString('\n')
++		if err != nil {
++			t.Fatalf("read: %v", err)
++		}
++		return strings.TrimSpace(line)
++	}
++	readEvent := func() (idLine, event, data string) {
++		for {
++			line := readLine()
++			if strings.HasPrefix(line, "id: ") {
++				idLine = line
++			} else if strings.HasPrefix(line, "event: ") {
++				event = line
++			} else if strings.HasPrefix(line, "data: ") {
++				data = line
++				return idLine, event, data
++			}
++		}
++	}
++
++	idLine, event, _ := readEvent()
++	if event != "event: op.snapshot" || idLine != "id: 0" {
++		t.Fatalf("initial: %q %q", event, idLine)
++	}
++
++	go func() {
++		time.Sleep(20 * time.Millisecond)
++		h.opMgr.AddStep(op, ansible.TaskStep{Name: "live-task", Status: "changed"})
++		time.Sleep(20 * time.Millisecond)
++		h.opMgr.Complete(op, 200)
++	}()
++
++	idLine, event, data := readEvent()
++	if event != "event: op.step" || idLine != "id: 1" || !strings.Contains(data, "live-task") {
++		t.Fatalf("step event: %q %q %q", idLine, event, data)
++	}
++	idLine, event, data = readEvent()
++	if event != "event: op.finished" || !strings.Contains(data, "succeeded") {
++		t.Fatalf("finished event: %q %q %q", idLine, event, data)
++	}
++}
++
++// TestOperationEventsJournalByteWindowTriggersSnapshot covers REV-1: the
++// record ring retains up to 500 steps but the replay journal byte-caps at
++// 512 KiB. A resume position older than the journal window (yet still inside
++// the record ring) must converge with a full snapshot, not an incremental
++// replay with a silent gap.
++func TestOperationEventsJournalByteWindowTriggersSnapshot(t *testing.T) {
++	fx := defaultFake()
++	h, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	h.execPlaybook = func(ctx context.Context, playbook string, vars map[string]string, onStep func(ansible.TaskStep)) (*ansible.PlaybookOutput, error) {
++		big := strings.Repeat("x", 16*1024)
++		var steps []ansible.TaskStep
++		for i := 0; i < 40; i++ {
++			s := ansible.TaskStep{Name: fmt.Sprintf("t%d", i), Status: "changed", Msg: big}
++			steps = append(steps, s)
++			onStep(s)
++		}
++		return ansible.NewPlaybookOutput(steps), nil
++	}
++	id := "op_dededede-dede-dede-dede-dededededede"
++	if rec := doPost(t, hnd, id); rec.Code != 200 {
++		t.Fatalf("post: %d %s", rec.Code, rec.Body.String())
++	}
++	op, err := h.opMgr.Get(id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	journalOldest := op.Journal().OldestSeq()
++	recordFirst := op.Snapshot().SeqFirst
++	if journalOldest <= recordFirst {
++		t.Fatalf("test setup expects journal window narrower than record ring: journal=%d record=%d", journalOldest, recordFirst)
++	}
++
++	// since=1 sits inside the record ring but before the journal window —
++	// a snapshot (not a gap-ridden incremental replay) is mandatory.
++	req := httptest.NewRequest("GET", "/api/operations/"+id+"/events?since=1", nil)
++	rec := httptest.NewRecorder()
++	hnd.ServeHTTP(rec, req)
++	body := rec.Body.String()
++	if !strings.Contains(body, "event: op.snapshot") {
++		t.Fatalf("pre-journal-window resume must send snapshot:\n%.200s", body)
++	}
++
++	// A position inside the journal window stays incremental.
++	req = httptest.NewRequest("GET", "/api/operations/"+id+"/events?since="+itoa(journalOldest), nil)
++	rec = httptest.NewRecorder()
++	hnd.ServeHTTP(rec, req)
++	if strings.Contains(rec.Body.String(), "op.snapshot") {
++		t.Fatalf("inside-window resume must stay incremental")
++	}
++}
++
++func itoa(n int64) string { return strconv.FormatInt(n, 10) }
++
++func TestOperationLookupMalformedIDIs404(t *testing.T) {
++	fx := defaultFake()
++	_, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	for _, path := range []string{"/api/operations/not-an-id", "/api/operations/not-an-id/events"} {
++		req := httptest.NewRequest("GET", path, nil)
++		rec := httptest.NewRecorder()
++		hnd.ServeHTTP(rec, req)
++		if rec.Code != http.StatusNotFound {
++			t.Fatalf("%s -> %d, want 404", path, rec.Code)
++		}
++	}
++}
++
++func TestOperationMetricsEmitted(t *testing.T) {
++	fx := defaultFake()
++	h, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	h.runner = ansible.NewRunner("")
++	h.ops = ops.NewRunner()
++
++	id := "op_cafebabc-cafe-cafe-cafe-cafebabecafe"
++	if rec := doPost(t, hnd, id); rec.Code != 200 {
++		t.Fatal(rec.Code)
++	}
++
++	req := httptest.NewRequest("GET", "/metrics", nil)
++	rec := httptest.NewRecorder()
++	hnd.ServeHTTP(rec, req)
++	body := rec.Body.String()
++	for _, want := range []string{
++		"dumpstore_operations_accepted_total 1",
++		`dumpstore_operations_finished_total{status="succeeded"} 1`,
++		"dumpstore_operations_running 0",
++	} {
++		if !strings.Contains(body, want) {
++			t.Fatalf("metrics missing %q", want)
++		}
++	}
++}
++
++func TestAuditLineCarriesOpAndReqID(t *testing.T) {
++	var buf bytes.Buffer
++	prev := slog.Default()
++	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
++	t.Cleanup(func() { slog.SetDefault(prev) })
++
++	fx := defaultFake()
++	_, hnd := newOpTestHandler(t, operations.DefaultConfig(), fx)
++	id := "op_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
++	if rec := doPost(t, hnd, id); rec.Code != 200 {
++		t.Fatal(rec.Code)
++	}
++	out := buf.String()
++	if !strings.Contains(out, "op_id="+id) || !strings.Contains(out, "req_id=req-test-1") {
++		t.Fatalf("audit correlation missing:\n%s", out)
++	}
++}
+diff --git a/internal/api/operations_wiring.go b/internal/api/operations_wiring.go
+new file mode 100644
+index 0000000..c6af0a6
+--- /dev/null
++++ b/internal/api/operations_wiring.go
+@@ -0,0 +1,170 @@
++package api
++
++import (
++	"encoding/json"
++	"errors"
++	"net/http"
++	"sync"
++
++	"dumpstore/internal/ansible"
++	"dumpstore/internal/operations"
++)
++
++// OperationIDHeader carries the stable operation identifier: the browser
++// sends a generated value on change requests (so a lost response still leaves
++// it with a known ID) and the server echoes the accepted ID back.
++const OperationIDHeader = "X-Operation-ID"
++
++// opExpiredBody is the deterministic non-recoverable result returned for an
++// operation that finished and has since been evicted from bounded history.
++type opExpiredBody struct {
++	Error       string `json:"error"`
++	Recoverable bool   `json:"recoverable"`
++	OperationID string `json:"operation_id"`
++}
++
++// opRunningBody answers an idempotent re-POST while the operation is still
++// executing: the change is not run a second time.
++type opRunningBody struct {
++	Error       string `json:"error"`
++	OperationID string `json:"operation_id"`
++	Status      string `json:"status"`
++}
++
++// opReplayBody is the canonical body of an idempotent terminal replay. The
++// original request's bespoke success body is not reconstructed; a retry that
++// lost the original response needs exactly the terminal status, the error
++// text (on failure) and the executed steps.
++type opReplayBody struct {
++	OperationID string             `json:"operation_id"`
++	Status      operations.Status  `json:"status"`
++	Error       string             `json:"error,omitempty"`
++	Tasks       []ansible.TaskStep `json:"tasks,omitempty"`
++}
++
++// beginOperation accepts the change into the operation registry immediately
++// before the first mutating execution. Call sites are expected to have
++// already completed all input validation: a rejected request must never
++// create an operation.
++//
++// It returns the (possibly wrapped) writer, a context-bearing request and a
++// replayed flag. When replayed is true the response has already been written
++// (400 malformed header, 409 same ID still running, 200/500 terminal replay,
++// 410 expired) and the handler MUST return immediately without executing the
++// change.
++//
++// Usage:
++//
++//	w, r, replayed := h.beginOperation(w, r, "user.create", name)
++//	if replayed {
++//	    return
++//	}
++func (h *Handler) beginOperation(w http.ResponseWriter, r *http.Request, action, target string) (http.ResponseWriter, *http.Request, bool) {
++	op, outcome, err := h.opMgr.Start(
++		r.Header.Get(OperationIDHeader),
++		action, target, ReqIDFromContext(r.Context()),
++	)
++	if err != nil {
++		switch {
++		case errors.Is(err, operations.ErrInvalidID):
++			writeError(r.Context(), w, http.StatusBadRequest, err, nil)
++		case errors.Is(err, operations.ErrExpired):
++			writeOperationExpired(w, r.Header.Get(OperationIDHeader))
++		default:
++			writeError(r.Context(), w, http.StatusInternalServerError, err, nil)
++		}
++		return w, r, true
++	}
++
++	w.Header().Set(OperationIDHeader, op.ID())
++
++	if outcome != operations.StartCreated {
++		h.writeReplay(w, op.Snapshot(), outcome)
++		return w, r, true
++	}
++
++	r = r.WithContext(operations.WithContext(r.Context(), op))
++	return &opResponseWriter{ResponseWriter: w, h: h, op: op}, r, false
++}
++
++// writeReplay renders the deterministic result of a re-POST with a known
++// operation ID: 409 while still running, otherwise the frozen terminal
++// outcome (200 success, 500 failure/timeout).
++func (h *Handler) writeReplay(w http.ResponseWriter, rec operations.Record, outcome operations.StartOutcome) {
++	w.Header().Set("Content-Type", "application/json")
++	if outcome == operations.StartReplayRunning {
++		w.WriteHeader(http.StatusConflict)
++		_ = json.NewEncoder(w).Encode(opRunningBody{
++			Error:       "operation already in progress",
++			OperationID: rec.ID,
++			Status:      string(operations.StatusRunning),
++		})
++		return
++	}
++	code := http.StatusOK
++	if rec.Status != operations.StatusSucceeded {
++		code = http.StatusInternalServerError
++	}
++	w.WriteHeader(code)
++	_ = json.NewEncoder(w).Encode(opReplayBody{
++		OperationID: rec.ID,
++		Status:      rec.Status,
++		Error:       rec.Error,
++		Tasks:       recordToTasks(rec),
++	})
++}
++
++// recordToTasks converts the operation step ring to the TaskStep shape used
++// by every existing op-log response.
++func recordToTasks(rec operations.Record) []ansible.TaskStep {
++	tasks := make([]ansible.TaskStep, 0, len(rec.Steps))
++	for _, s := range rec.Steps {
++		tasks = append(tasks, ansible.TaskStep{Name: s.Name, Status: s.Status, Msg: s.Msg})
++	}
++	return tasks
++}
++
++// writeOperationExpired answers 410 for a tombstoned (or re-POSTed expired)
++// operation ID.
++func writeOperationExpired(w http.ResponseWriter, id string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusGone)
++	_ = json.NewEncoder(w).Encode(opExpiredBody{
++		Error:       "operation expired: its result is no longer available",
++		Recoverable: false,
++		OperationID: id,
++	})
++}
++
++// opResponseWriter finalises the operation the first time the handler commits
++// its response — including when the write fails because the client has
++// disconnected: the mutation keeps running (WithoutCancel in the runners)
++// and the terminal state still becomes queryable.
++type opResponseWriter struct {
++	http.ResponseWriter
++	h    *Handler
++	op   *operations.Operation
++	once sync.Once
++}
++
++func (w *opResponseWriter) finalize(code int) {
++	w.once.Do(func() { w.h.opMgr.Complete(w.op, code) })
++}
++
++func (w *opResponseWriter) WriteHeader(code int) {
++	w.finalize(code)
++	w.ResponseWriter.WriteHeader(code)
++}
++
++func (w *opResponseWriter) Write(b []byte) (int, error) {
++	// An implicit 200 happens when the handler writes without WriteHeader.
++	w.finalize(http.StatusOK)
++	return w.ResponseWriter.Write(b)
++}
++
++// Flush forwards to the underlying writer when supported.
++func (w *opResponseWriter) Flush() {
++	if f, ok := w.ResponseWriter.(http.Flusher); ok {
++		f.Flush()
++	}
++}
+diff --git a/internal/api/pool_handlers.go b/internal/api/pool_handlers.go
+index 00aa305..8cca482 100644
+--- a/internal/api/pool_handlers.go
++++ b/internal/api/pool_handlers.go
+@@ -98,6 +98,10 @@ func (h *Handler) createPool(w http.ResponseWriter, r *http.Request) {
+ 		argv = append(argv, req.VdevType)
+ 	}
+ 	argv = append(argv, req.Devices...)
++	w, r, replayed := h.beginOperation(w, r, "pool.create", req.Name+" "+req.VdevType+" ["+strings.Join(req.Devices, " ")+"]")
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Create pool " + req.Name, Argv: argv})
+ 	auditLog(r.Context(), r, "pool.create", req.Name+" "+req.VdevType+" ["+strings.Join(req.Devices, " ")+"]", err)
+ 	if err != nil {
+@@ -214,6 +218,10 @@ func (h *Handler) addPoolDevices(w http.ResponseWriter, r *http.Request, pool, k
+ 		argv = append(argv, kind)
+ 	}
+ 	argv = append(argv, devices...)
++	w, r, replayed := h.beginOperation(w, r, "pool.add_"+kind, pool+" ["+strings.Join(devices, " ")+"]")
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Add " + kind + " devices to " + pool, Argv: argv})
+ 	auditLog(r.Context(), r, "pool.add_"+kind, pool+" ["+strings.Join(devices, " ")+"]", err)
+ 	if err != nil {
+@@ -238,6 +246,10 @@ func (h *Handler) removePoolDevice(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid device identifier"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "pool.remove_device", pool+" "+device)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{
+ 		Name: "Remove " + device + " from " + pool,
+ 		Argv: []string{"zpool", "remove", pool, device},
+@@ -281,6 +293,10 @@ func (h *Handler) importPool(w http.ResponseWriter, r *http.Request) {
+ 		argv = append(argv, "-f")
+ 	}
+ 	argv = append(argv, req.Pool)
++	w, r, replayed := h.beginOperation(w, r, "pool.import", req.Pool)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Import pool " + req.Pool, Argv: argv})
+ 	auditLog(r.Context(), r, "pool.import", req.Pool, err)
+ 	if err != nil {
+@@ -300,6 +316,10 @@ func (h *Handler) exportPool(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid pool name"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "pool.export", pool)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Export pool " + pool, Argv: []string{"zpool", "export", pool}})
+ 	auditLog(r.Context(), r, "pool.export", pool, err)
+ 	if err != nil {
+diff --git a/internal/api/service_handlers.go b/internal/api/service_handlers.go
+index 146dad2..7cd1f95 100644
+--- a/internal/api/service_handlers.go
++++ b/internal/api/service_handlers.go
+@@ -55,6 +55,10 @@ func (h *Handler) mutateService(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "service."+action, svc)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), servicePlaybook(), map[string]string{
+ 		"service_name": unitName,
+ 		"action":       action,
+diff --git a/internal/api/smb_handlers.go b/internal/api/smb_handlers.go
+index 33acd28..2230bcc 100644
+--- a/internal/api/smb_handlers.go
++++ b/internal/api/smb_handlers.go
+@@ -95,6 +95,10 @@ func (h *Handler) initSamba(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// Step 1: check smbd is installed, back up existing conf, create usershares dir.
++	w, r, replayed := h.beginOperation(w, r, "smb.init", "")
++	if replayed {
++		return
++	}
+ 	out1, err := h.runOp(r.Context(), "smb_init.yml", map[string]string{})
+ 	auditLog(r.Context(), r, "smb.init", "", err)
+ 	if err != nil {
+@@ -170,6 +174,10 @@ func (h *Handler) setSMBShare(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "smb_share.set", dataset)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "smb_usershare_set.yml", map[string]string{
+ 		"dataset":   dataset,
+ 		"sharename": req.Sharename,
+@@ -201,6 +209,10 @@ func (h *Handler) deleteSMBShare(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "smb_share.delete", dataset)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "smb_usershare_unset.yml", map[string]string{
+ 		"sharename": sharename,
+ 	})
+@@ -260,6 +272,10 @@ func (h *Handler) addSambaUser(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	h.userMu.Lock()
+ 	defer h.userMu.Unlock()
++	w, r, replayed := h.beginOperation(w, r, "smb_user.add", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "smb_user_add.yml", map[string]string{
+ 		"username":     name,
+ 		"smb_password": req.Password,
+@@ -288,6 +304,10 @@ func (h *Handler) removeSambaUser(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	h.userMu.Lock()
+ 	defer h.userMu.Unlock()
++	w, r, replayed := h.beginOperation(w, r, "smb_user.remove", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "smb_user_remove.yml", map[string]string{
+ 		"username": name,
+ 	})
+@@ -407,6 +427,10 @@ func (h *Handler) setSMBHomes(w http.ResponseWriter, r *http.Request) {
+ 		DirectoryMask: req.DirectoryMask,
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "smb_homes.set", req.Dataset)
++	if replayed {
++		return
++	}
+ 	out, err := h.applyConfig(r, &cfg)
+ 	auditLog(r.Context(), r, "smb_homes.set", req.Dataset, err)
+ 	if err != nil {
+@@ -439,6 +463,10 @@ func (h *Handler) deleteSMBHomes(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	cfg.Homes = nil
+ 
++	w, r, replayed := h.beginOperation(w, r, "smb_homes.delete", "")
++	if replayed {
++		return
++	}
+ 	out, err := h.applyConfig(r, &cfg)
+ 	auditLog(r.Context(), r, "smb_homes.delete", "", err)
+ 	if err != nil {
+@@ -537,6 +565,10 @@ func (h *Handler) createTimeMachineShare(w http.ResponseWriter, r *http.Request)
+ 		cfg.TimeMachine = append(cfg.TimeMachine, newShare)
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "smb_timemachine.create", req.Dataset)
++	if replayed {
++		return
++	}
+ 	out, err := h.applyConfig(r, &cfg)
+ 	auditLog(r.Context(), r, "smb_timemachine.create", req.Dataset, err)
+ 	if err != nil {
+@@ -582,6 +614,10 @@ func (h *Handler) deleteTimeMachineShare(w http.ResponseWriter, r *http.Request)
+ 	}
+ 	cfg.TimeMachine = filtered
+ 
++	w, r, replayed := h.beginOperation(w, r, "smb_timemachine.delete", sharename)
++	if replayed {
++		return
++	}
+ 	out, err := h.applyConfig(r, &cfg)
+ 	auditLog(r.Context(), r, "smb_timemachine.delete", sharename, err)
+ 	if err != nil {
+diff --git a/internal/api/tls_handlers.go b/internal/api/tls_handlers.go
+index d3401ff..a31ea4e 100644
+--- a/internal/api/tls_handlers.go
++++ b/internal/api/tls_handlers.go
+@@ -84,6 +84,10 @@ func (h *Handler) tlsGenCert(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "tls.gencert", req.Hostname)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "tls_gencert.yml", map[string]string{
+ 		"hostname": req.Hostname,
+ 		"cert_dir": req.CertDir,
+@@ -149,6 +153,10 @@ func (h *Handler) tlsSetConfig(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "tls.set_config", req.CertPath)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "tls_set_config.yml", map[string]string{
+ 		"config_path": h.configPath,
+ 		"cert_path":   req.CertPath,
+@@ -201,6 +209,10 @@ func (h *Handler) tlsAcmeIssue(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "tls.acme_issue", req.Domain)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "tls_acme_issue.yml", map[string]string{
+ 		"email":    req.Email,
+ 		"domain":   req.Domain,
+@@ -271,6 +283,10 @@ func (h *Handler) tlsAcmeRenew(w http.ResponseWriter, r *http.Request) {
+ 		certDir = certDirFromCertPath(certPath, h.configPath)
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "tls.acme_renew", acmeDomain)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "tls_acme_renew.yml", map[string]string{
+ 		"email":    acmeEmail,
+ 		"domain":   acmeDomain,
+diff --git a/internal/api/user_handlers.go b/internal/api/user_handlers.go
+index 9c7af4a..0f9cfa0 100644
+--- a/internal/api/user_handlers.go
++++ b/internal/api/user_handlers.go
+@@ -94,6 +94,10 @@ func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
+ 		"create_group": createGroup,
+ 		"smb_user":     smbUser,
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "user.create", req.Username)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "user_create.yml", vars)
+ 	auditLog(r.Context(), r, "user.create", req.Username, err)
+ 	if err != nil {
+@@ -152,6 +156,10 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
+ 
+ 	h.userMu.Lock()
+ 	defer h.userMu.Unlock()
++	w, r, replayed := h.beginOperation(w, r, "user.delete", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "user_delete.yml", map[string]string{
+ 		"username": name,
+ 		"uid":      fmt.Sprintf("%d", target.UID),
+@@ -247,6 +255,10 @@ func (h *Handler) modifyUser(w http.ResponseWriter, r *http.Request) {
+ 
+ 	h.userMu.Lock()
+ 	defer h.userMu.Unlock()
++	w, r, replayed := h.beginOperation(w, r, "user.modify", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "user_modify.yml", map[string]string{
+ 		"username":      name,
+ 		"uid":           fmt.Sprintf("%d", target.UID),
+@@ -340,6 +352,10 @@ func (h *Handler) addSSHKey(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "sshkey.add", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "user_ssh_key_add.yml", map[string]string{
+ 		"username": name,
+ 		"home":     target.Home,
+@@ -395,6 +411,10 @@ func (h *Handler) removeSSHKey(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "sshkey.remove", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "user_ssh_key_remove.yml", map[string]string{
+ 		"home": target.Home,
+ 		"key":  req.Key,
+@@ -429,6 +449,10 @@ func (h *Handler) createGroup(w http.ResponseWriter, r *http.Request) {
+ 
+ 	h.userMu.Lock()
+ 	defer h.userMu.Unlock()
++	w, r, replayed := h.beginOperation(w, r, "group.create", req.Groupname)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "group_create.yml", map[string]string{
+ 		"groupname": req.Groupname,
+ 		"gid":       req.GID,
+@@ -484,6 +508,10 @@ func (h *Handler) deleteGroup(w http.ResponseWriter, r *http.Request) {
+ 
+ 	h.userMu.Lock()
+ 	defer h.userMu.Unlock()
++	w, r, replayed := h.beginOperation(w, r, "group.delete", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "group_delete.yml", map[string]string{
+ 		"groupname": name,
+ 		"gid":       fmt.Sprintf("%d", target.GID),
+@@ -582,6 +610,10 @@ func (h *Handler) modifyGroup(w http.ResponseWriter, r *http.Request) {
+ 
+ 	h.userMu.Lock()
+ 	defer h.userMu.Unlock()
++	w, r, replayed := h.beginOperation(w, r, "group.modify", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "group_modify.yml", map[string]string{
+ 		"groupname":      name,
+ 		"gid":            fmt.Sprintf("%d", target.GID),
+diff --git a/internal/api/zfs_handlers.go b/internal/api/zfs_handlers.go
+index 380d216..cd36c33 100644
+--- a/internal/api/zfs_handlers.go
++++ b/internal/api/zfs_handlers.go
+@@ -129,6 +129,10 @@ func (h *Handler) setDatasetProps(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "dataset.modify", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "zfs_dataset_set.yml", vars)
+ 	auditLog(r.Context(), r, "dataset.modify", name, err)
+ 	if err != nil {
+@@ -221,6 +225,10 @@ func (h *Handler) createDataset(w http.ResponseWriter, r *http.Request) {
+ 		"copies":       req.Copies,
+ 		"xattr":        req.Xattr,
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "dataset.create", req.Name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "zfs_dataset_create.yml", vars)
+ 	auditLog(r.Context(), r, "dataset.create", req.Name, err)
+ 	if err != nil {
+@@ -293,6 +301,10 @@ func (h *Handler) createSnapshot(w http.ResponseWriter, r *http.Request) {
+ 		argv = append(argv, "-r")
+ 	}
+ 	argv = append(argv, req.Dataset+"@"+req.SnapName)
++	w, r, replayed := h.beginOperation(w, r, "snapshot.create", req.Dataset+"@"+req.SnapName)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Create snapshot " + req.Dataset + "@" + req.SnapName, Argv: argv})
+ 	auditLog(r.Context(), r, "snapshot.create", req.Dataset+"@"+req.SnapName, err)
+ 	if err != nil {
+@@ -348,6 +360,10 @@ func (h *Handler) renameDataset(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "dataset.rename", req.Name+" -> "+req.NewName)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "zfs_dataset_rename.yml", map[string]string{
+ 		"name":     req.Name,
+ 		"new_name": req.NewName,
+@@ -396,6 +412,10 @@ func (h *Handler) deleteDataset(w http.ResponseWriter, r *http.Request) {
+ 		recursive = "true"
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "dataset.destroy", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "zfs_dataset_destroy.yml", map[string]string{
+ 		"name":      name,
+ 		"recursive": recursive,
+@@ -446,6 +466,10 @@ func (h *Handler) cloneSnapshot(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "snapshot.clone", req.Snapshot+" -> "+req.Target)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{
+ 		Name: "Clone " + req.Snapshot + " to " + req.Target,
+ 		Argv: []string{"zfs", "clone", req.Snapshot, req.Target},
+@@ -641,6 +665,10 @@ func (h *Handler) setUserQuota(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusNotFound, fmt.Errorf("dataset %q not found", name), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "dataset.quota_set", name+" "+req.Kind+"quota@"+req.Principal+"="+req.Quota)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{
+ 		Name: "Set " + req.Kind + "quota@" + req.Principal + " on " + name,
+ 		Argv: []string{"zfs", "set", req.Kind + "quota@" + req.Principal + "=" + req.Quota, name},
+@@ -808,6 +836,10 @@ func (h *Handler) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
+ 		argv = append(argv, "-r")
+ 	}
+ 	argv = append(argv, snapshot)
++	w, r, replayed := h.beginOperation(w, r, "snapshot.destroy", snapshot)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Destroy snapshot " + snapshot, Argv: argv})
+ 	auditLog(r.Context(), r, "snapshot.destroy", snapshot, err)
+ 	if err != nil {
+@@ -862,6 +894,10 @@ func (h *Handler) deleteSnapshotBatch(w http.ResponseWriter, r *http.Request) {
+ 			ContinueOnError: true,
+ 		})
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "snapshot.batch_destroy", strings.Join(body.Snapshots, ","))
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), steps...)
+ 	auditLog(r.Context(), r, "snapshot.batch_destroy", strings.Join(body.Snapshots, ","), err)
+ 	if err != nil {
+@@ -961,6 +997,10 @@ func (h *Handler) setDatasetOwnership(w http.ResponseWriter, r *http.Request) {
+ 		recursive = "true"
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "dataset.chown", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "dataset_chown.yml", map[string]string{
+ 		"mountpoint": mp,
+ 		"owner":      req.Owner,
+@@ -1012,6 +1052,10 @@ func (h *Handler) startScrub(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid pool name"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "scrub.start", pool)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Start scrub on " + pool, Argv: []string{"zpool", "scrub", pool}})
+ 	auditLog(r.Context(), r, "scrub.start", pool, err)
+ 	if err != nil {
+@@ -1034,6 +1078,10 @@ func (h *Handler) cancelScrub(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid pool name"), nil)
+ 		return
+ 	}
++	w, r, replayed := h.beginOperation(w, r, "scrub.cancel", pool)
++	if replayed {
++		return
++	}
+ 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Cancel scrub on " + pool, Argv: []string{"zpool", "scrub", "-s", pool}})
+ 	auditLog(r.Context(), r, "scrub.cancel", pool, err)
+ 	if err != nil {
+@@ -1076,6 +1124,10 @@ func (h *Handler) setScrubSchedule(w http.ResponseWriter, r *http.Request) {
+ 		if req.ThresholdDays <= 0 {
+ 			req.ThresholdDays = 35
+ 		}
++		w, r, replayed := h.beginOperation(w, r, "scrub_schedule.set", pool)
++		if replayed {
++			return
++		}
+ 		out, err := h.runOp(r.Context(), "zfs_scrub_periodic_enable.yml", map[string]string{
+ 			"pool":           pool,
+ 			"threshold_days": strconv.Itoa(req.ThresholdDays),
+@@ -1090,6 +1142,10 @@ func (h *Handler) setScrubSchedule(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// Linux: add to ZFS_SCRUB_POOLS — no schedule params required.
++	w, r, replayed := h.beginOperation(w, r, "scrub_schedule.set", pool)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "zfs_scrub_zfsutils_enable.yml", map[string]string{"pool": pool})
+ 	auditLog(r.Context(), r, "scrub_schedule.set", pool, err)
+ 	if err != nil {
+@@ -1114,6 +1170,10 @@ func (h *Handler) deleteScrubSchedule(w http.ResponseWriter, r *http.Request) {
+ 		playbook = "zfs_scrub_periodic_disable.yml"
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "scrub_schedule.delete", pool)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), playbook, map[string]string{"pool": pool})
+ 	auditLog(r.Context(), r, "scrub_schedule.delete", pool, err)
+ 	if err != nil {
+@@ -1222,6 +1282,10 @@ func (h *Handler) setAutoSnapshotProps(w http.ResponseWriter, r *http.Request) {
+ 		vars[ap.varName] = val
+ 	}
+ 
++	w, r, replayed := h.beginOperation(w, r, "auto_snapshot.set", name)
++	if replayed {
++		return
++	}
+ 	out, err := h.runOp(r.Context(), "zfs_autosnap_set.yml", vars)
+ 	auditLog(r.Context(), r, "auto_snapshot.set", name, err)
+ 	if err != nil {
+diff --git a/internal/broker/journal.go b/internal/broker/journal.go
+new file mode 100644
+index 0000000..ad1b93a
+--- /dev/null
++++ b/internal/broker/journal.go
+@@ -0,0 +1,190 @@
++package broker
++
++import (
++	"encoding/json"
++	"errors"
++	"log/slog"
++	"sync"
++)
++
++// ErrJournalClosed is returned by Publish after the journal has been sealed
++// (e.g. an operation reached its terminal state).
++var ErrJournalClosed = errors.New("journal closed")
++
++// subscriberBufferSize mirrors the buffer size of plain Broker subscriber
++// channels: a lagging consumer is dropped rather than stalling publishers.
++const subscriberBufferSize = 32
++
++// Event is one sequenced journal entry. Data is the JSON-encoded payload as
++// supplied to Publish; Seq is assigned by the journal and is unique for the
++// journal's lifetime.
++type Event struct {
++	Seq  int64
++	Data []byte
++}
++
++// Journal is a bounded, ordered, replayable event stream.
++//
++// Unlike Broker (last-value cache per topic), a Journal keeps a sliding
++// window of every published event so a subscriber can resume from the last
++// sequence it has already seen (SSE Last-Event-ID semantics). Delivery is
++// non-blocking: when a subscriber's buffer fills it is closed and removed,
++// exactly like Broker's slow-consumer policy; the client reconnects and
++// replays the gap from the retained window.
++//
++// The zero value is not usable; use NewJournal.
++type Journal struct {
++	mu       sync.Mutex
++	buf      []Event // retained sliding window, oldest first
++	total    int     // sum of len(Data) over buf
++	nextSeq  int64   // seq assigned by the last Publish; 0 before the first
++	stepCap  int     // maximum retained events
++	bytesCap int     // maximum retained payload bytes
++	closed   bool
++	subs     []chan Event
++}
++
++// NewJournal returns a Journal retaining at most stepCap events and
++// bytesCap payload bytes (the newest event is always retained even when it
++// alone exceeds bytesCap). Non-positive caps are treated as 1.
++func NewJournal(stepCap, bytesCap int) *Journal {
++	if stepCap < 1 {
++		stepCap = 1
++	}
++	if bytesCap < 1 {
++		bytesCap = 1
++	}
++	return &Journal{stepCap: stepCap, bytesCap: bytesCap}
++}
++
++// Publish JSON-encodes data, assigns it the next sequence number, appends it
++// to the retained window (evicting oldest entries to satisfy the caps) and
++// delivers it to every current subscriber. Slow subscribers are dropped.
++// After Close, Publish returns ErrJournalClosed.
++func (j *Journal) Publish(data any) (Event, error) {
++	payload, err := json.Marshal(data)
++	if err != nil {
++		return Event{}, err
++	}
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	if j.closed {
++		return Event{}, ErrJournalClosed
++	}
++	j.nextSeq++
++	ev := Event{Seq: j.nextSeq, Data: payload}
++	j.buf = append(j.buf, ev)
++	j.total += len(payload)
++	j.trimLocked()
++	j.deliverLocked(ev)
++	return ev, nil
++}
++
++// trimLocked evicts oldest events until both caps are satisfied. The newest
++// event is always kept. Caller must hold j.mu.
++func (j *Journal) trimLocked() {
++	for len(j.buf) > 1 && (len(j.buf) > j.stepCap || j.total > j.bytesCap) {
++		j.total -= len(j.buf[0].Data)
++		j.buf[0] = Event{} // help GC
++		j.buf = j.buf[1:]
++	}
++}
++
++// deliverLocked sends ev to every subscriber, closing and removing any whose
++// buffer is full. Caller must hold j.mu.
++func (j *Journal) deliverLocked(ev Event) {
++	n := 0
++	for _, ch := range j.subs {
++		select {
++		case ch <- ev:
++			j.subs[n] = ch
++			n++
++		default:
++			slog.Warn("journal: subscriber slow, closing stream", "seq", ev.Seq)
++			close(ch)
++		}
++	}
++	for i := n; i < len(j.subs); i++ {
++		j.subs[i] = nil
++	}
++	j.subs = j.subs[:n]
++}
++
++// Replay returns the retained events with Seq strictly greater than afterSeq
++// and the latest assigned seq (0 when nothing has been published). Callers
++// compare afterSeq with OldestSeq to tell "nothing new" apart from
++// "position older than the retained window".
++func (j *Journal) Replay(afterSeq int64) (events []Event, latest int64) {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	events = make([]Event, 0, len(j.buf))
++	for _, ev := range j.buf {
++		if ev.Seq > afterSeq {
++			events = append(events, ev)
++		}
++	}
++	return events, j.nextSeq
++}
++
++// OldestSeq returns the seq of the oldest still-retained event. It is 0 when
++// nothing has been published, and equals LatestSeq when only one event
++// remains. A resume position below OldestSeq means the gap has aged out and
++// the caller needs a full snapshot rather than event replay.
++func (j *Journal) OldestSeq() int64 {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	if len(j.buf) == 0 {
++		return 0
++	}
++	return j.buf[0].Seq
++}
++
++// Subscribe registers a subscriber and returns the retained events newer
++// than afterSeq (the initial replay), the live event channel, and the
++// latest assigned seq. Events published after subscription are delivered on
++// the channel until it is closed (slow consumer) or Unsubscribe is called.
++// Subscribing to a closed journal is allowed so late subscribers can read
++// the terminal state via replay; use Closed to distinguish.
++func (j *Journal) Subscribe(afterSeq int64) (initial []Event, ch chan Event, latest int64) {
++	ch = make(chan Event, subscriberBufferSize)
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	initial = make([]Event, 0, len(j.buf))
++	for _, ev := range j.buf {
++		if ev.Seq > afterSeq {
++			initial = append(initial, ev)
++		}
++	}
++	j.subs = append(j.subs, ch)
++	return initial, ch, j.nextSeq
++}
++
++// Unsubscribe removes ch and closes it. A channel already removed (slow
++// consumer drop) is a no-op.
++func (j *Journal) Unsubscribe(ch chan Event) {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	for i, c := range j.subs {
++		if c == ch {
++			j.subs = append(j.subs[:i], j.subs[i+1:]...)
++			close(ch)
++			return
++		}
++	}
++}
++
++// Close seals the journal: further Publish calls fail with ErrJournalClosed.
++// Existing subscribers are not closed — terminal delivery happens through
++// the final event, and late subscribers keep replay access.
++func (j *Journal) Close() {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	j.closed = true
++}
++
++// Closed reports whether the journal has been sealed.
++func (j *Journal) Closed() bool {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	return j.closed
++}
+diff --git a/internal/broker/journal_test.go b/internal/broker/journal_test.go
+new file mode 100644
+index 0000000..d902ace
+--- /dev/null
++++ b/internal/broker/journal_test.go
+@@ -0,0 +1,295 @@
++package broker
++
++import (
++	"errors"
++	"sync"
++	"testing"
++	"time"
++)
++
++func drain(ch chan Event, timeout time.Duration) []Event {
++	var out []Event
++	for {
++		select {
++		case ev, ok := <-ch:
++			if !ok {
++				return out
++			}
++			out = append(out, ev)
++		case <-time.After(timeout):
++			return out
++		}
++	}
++}
++
++func TestJournalPublishAssignsMonotonicSeq(t *testing.T) {
++	j := NewJournal(100, 1<<20)
++	for i := int64(1); i <= 10; i++ {
++		ev, err := j.Publish(i)
++		if err != nil {
++			t.Fatalf("publish %d: %v", i, err)
++		}
++		if ev.Seq != i {
++			t.Fatalf("seq = %d, want %d", ev.Seq, i)
++		}
++	}
++	events, latest := j.Replay(0)
++	if latest != 10 || len(events) != 10 {
++		t.Fatalf("replay: latest=%d len=%d", latest, len(events))
++	}
++	for i, ev := range events {
++		if ev.Seq != int64(i+1) {
++			t.Fatalf("replay seq at %d = %d", i, ev.Seq)
++		}
++	}
++}
++
++func TestJournalReplayAfter(t *testing.T) {
++	j := NewJournal(100, 1<<20)
++	for i := 0; i < 5; i++ {
++		if _, err := j.Publish(i); err != nil {
++			t.Fatal(err)
++		}
++	}
++	tests := []struct {
++		after   int64
++		wantLen int
++		wantSeq int64 // first expected seq
++	}{
++		{0, 5, 1}, // from start
++		{2, 3, 3}, // strict >
++		{5, 0, 0}, // caught up: nothing new
++		{99, 0, 0},
++	}
++	for _, tt := range tests {
++		events, latest := j.Replay(tt.after)
++		if len(events) != tt.wantLen {
++			t.Errorf("after=%d: got %d events, want %d", tt.after, len(events), tt.wantLen)
++		}
++		if tt.wantLen > 0 && (events[0].Seq != tt.wantSeq || latest != 5) {
++			t.Errorf("after=%d: first=%d latest=%d", tt.after, events[0].Seq, latest)
++		}
++	}
++}
++
++func TestJournalSubscribeReplayThenLive(t *testing.T) {
++	j := NewJournal(100, 1<<20)
++	for i := 0; i < 3; i++ {
++		if _, err := j.Publish(i); err != nil {
++			t.Fatal(err)
++		}
++	}
++	initial, ch, latest := j.Subscribe(2)
++	if latest != 3 || len(initial) != 1 || initial[0].Seq != 3 {
++		t.Fatalf("initial replay: latest=%d initial=%v", latest, initial)
++	}
++	for i := 3; i < 6; i++ {
++		if _, err := j.Publish(i); err != nil {
++			t.Fatal(err)
++		}
++	}
++	live := drain(ch, 200*time.Millisecond)
++	if len(live) != 3 {
++		t.Fatalf("got %d live events, want 3", len(live))
++	}
++	for i, ev := range live {
++		if ev.Seq != int64(i+4) {
++			t.Fatalf("live[%d] seq=%d, want %d", i, ev.Seq, i+4)
++		}
++	}
++	j.Unsubscribe(ch)
++	if _, ok := <-ch; ok {
++		t.Fatal("channel should be closed after Unsubscribe")
++	}
++	// Unsubscribe twice is a no-op.
++	j.Unsubscribe(ch)
++}
++
++func TestJournalSlowSubscriberDroppedOthersUnaffected(t *testing.T) {
++	j := NewJournal(1000, 1<<20)
++	_, chSlow, _ := j.Subscribe(0)
++	_, chFast, _ := j.Subscribe(0)
++
++	// The fast subscriber drains continuously; the slow one never reads.
++	var fastMu sync.Mutex
++	var fastSeqs []int64
++	fastDone := make(chan struct{})
++	go func() {
++		defer close(fastDone)
++		for ev := range chFast {
++			fastMu.Lock()
++			fastSeqs = append(fastSeqs, ev.Seq)
++			fastMu.Unlock()
++		}
++	}()
++
++	const published = subscriberBufferSize + 10
++	publishDone := make(chan struct{})
++	go func() {
++		for i := 0; i < published; i++ {
++			if _, err := j.Publish(i); err != nil {
++				t.Errorf("publish: %v", err)
++				return
++			}
++		}
++		close(publishDone)
++	}()
++	select {
++	case <-publishDone:
++	case <-time.After(time.Second):
++		t.Fatal("publisher blocked on slow subscriber")
++	}
++
++	// Slow channel gets closed by the journal.
++	deadline := time.After(time.Second)
++	for {
++		select {
++		case _, ok := <-chSlow:
++			if !ok {
++				goto dropped
++			}
++		case <-deadline:
++			t.Fatal("slow subscriber was not dropped")
++		}
++	}
++dropped:
++
++	j.Unsubscribe(chFast)
++	<-fastDone
++	fastMu.Lock()
++	got := len(fastSeqs)
++	fastMu.Unlock()
++	if got != published {
++		t.Fatalf("fast subscriber got %d events, want %d", got, published)
++	}
++
++	// A fresh subscription replays the whole retained sequence: the
++	// slow consumer reconnects along the same path without a gap.
++	initial, ch2, latest := j.Subscribe(0)
++	if latest != published {
++		t.Fatalf("latest = %d, want %d", latest, published)
++	}
++	seqs := map[int64]bool{}
++	for _, ev := range initial {
++		seqs[ev.Seq] = true
++	}
++	for _, ev := range drain(ch2, 100*time.Millisecond) {
++		seqs[ev.Seq] = true
++	}
++	if len(seqs) != published {
++		t.Fatalf("reconnect replay has %d unique seqs, want %d", len(seqs), published)
++	}
++	j.Unsubscribe(ch2)
++}
++
++func TestJournalStepCapEvictsOldest(t *testing.T) {
++	j := NewJournal(5, 1<<20)
++	for i := 0; i < 20; i++ {
++		if _, err := j.Publish(i); err != nil {
++			t.Fatal(err)
++		}
++	}
++	events, latest := j.Replay(0)
++	if len(events) != 5 {
++		t.Fatalf("retained %d events, want 5", len(events))
++	}
++	if events[0].Seq != 16 || events[4].Seq != 20 || latest != 20 {
++		t.Fatalf("eviction window: %+v latest=%d", events, latest)
++	}
++	if j.OldestSeq() != 16 {
++		t.Fatalf("OldestSeq = %d, want 16", j.OldestSeq())
++	}
++}
++
++func TestJournalBytesCapEvictsOldest(t *testing.T) {
++	// Each payload marshals to 2 bytes ("42"); cap at ~5 payloads.
++	j := NewJournal(1000, 10)
++	for i := 0; i < 10; i++ {
++		if _, err := j.Publish(42); err != nil {
++			t.Fatal(err)
++		}
++	}
++	events, _ := j.Replay(0)
++	if len(events) != 5 {
++		t.Fatalf("bytes cap retained %d events, want 5", len(events))
++	}
++	// Newest oversized event is always retained.
++	j2 := NewJournal(1000, 1)
++	if _, err := j2.Publish("a payload much larger than the cap"); err != nil {
++		t.Fatal(err)
++	}
++	events, _ = j2.Replay(0)
++	if len(events) != 1 {
++		t.Fatalf("newest event should always be retained, got %d", len(events))
++	}
++}
++
++func TestJournalBoundedAfter10kPublishes(t *testing.T) {
++	j := NewJournal(500, 64*1024)
++	for i := 0; i < 10_000; i++ {
++		if _, err := j.Publish(i); err != nil {
++			t.Fatal(err)
++		}
++	}
++	events, _ := j.Replay(0)
++	if len(events) > 500 {
++		t.Fatalf("retained %d events, cap 500", len(events))
++	}
++	if events[len(events)-1].Seq != 10_000 {
++		t.Fatalf("latest retained seq = %d, want 10000", events[len(events)-1].Seq)
++	}
++}
++
++func TestJournalCloseSealsButKeepsReplay(t *testing.T) {
++	j := NewJournal(100, 1<<20)
++	if _, err := j.Publish("terminal"); err != nil {
++		t.Fatal(err)
++	}
++	j.Close()
++	if !j.Closed() {
++		t.Fatal("Closed() = false")
++	}
++	if _, err := j.Publish("after close"); !errors.Is(err, ErrJournalClosed) {
++		t.Fatalf("after close err = %v, want ErrJournalClosed", err)
++	}
++	events, latest := j.Replay(0)
++	if latest != 1 || len(events) != 1 {
++		t.Fatalf("replay after close: %+v latest=%d", events, latest)
++	}
++	// Late subscription still works for terminal state.
++	initial, ch, _ := j.Subscribe(0)
++	if len(initial) != 1 {
++		t.Fatalf("late subscriber initial = %d events", len(initial))
++	}
++	j.Unsubscribe(ch)
++}
++
++func TestJournalConcurrent(t *testing.T) {
++	j := NewJournal(1000, 1<<20)
++	const publishers, per, subscribers = 10, 100, 4
++	var wg sync.WaitGroup
++	chans := make([]chan Event, subscribers)
++	for i := range chans {
++		_, ch, _ := j.Subscribe(0)
++		chans[i] = ch
++	}
++	for p := 0; p < publishers; p++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < per; i++ {
++				if _, err := j.Publish(i); err != nil {
++					t.Errorf("publish: %v", err)
++				}
++			}
++		}()
++	}
++	wg.Wait()
++	events, latest := j.Replay(0)
++	if latest != publishers*per || len(events) != publishers*per {
++		t.Fatalf("latest=%d retained=%d, want %d", latest, len(events), publishers*per)
++	}
++	for _, ch := range chans {
++		j.Unsubscribe(ch)
++	}
++}
+diff --git a/internal/operations/context.go b/internal/operations/context.go
+new file mode 100644
+index 0000000..fda78c5
+--- /dev/null
++++ b/internal/operations/context.go
+@@ -0,0 +1,19 @@
++package operations
++
++import "context"
++
++type ctxKey struct{}
++
++// WithContext returns a context carrying op so the execution lanes and the
++// audit logger can discover the current operation without an explicit
++// parameter through every helper.
++func WithContext(ctx context.Context, op *Operation) context.Context {
++	return context.WithValue(ctx, ctxKey{}, op)
++}
++
++// FromContext returns the operation attached to ctx, or nil when the request
++// path did not begin one.
++func FromContext(ctx context.Context) *Operation {
++	op, _ := ctx.Value(ctxKey{}).(*Operation)
++	return op
++}
+diff --git a/internal/operations/manager.go b/internal/operations/manager.go
+new file mode 100644
+index 0000000..6774bd6
+--- /dev/null
++++ b/internal/operations/manager.go
+@@ -0,0 +1,378 @@
++package operations
++
++import (
++	"crypto/rand"
++	"encoding/hex"
++	"log/slog"
++	"regexp"
++	"sort"
++	"sync"
++	"time"
++
++	"dumpstore/internal/ansible"
++	"dumpstore/internal/broker"
++)
++
++// History bounds (see spec FR-14). Named constants so operators/reviewers
++// have one place to adjust retention.
++const (
++	// DefaultMaxStepsPerOperation is the per-operation step ring size.
++	DefaultMaxStepsPerOperation = 500
++	// DefaultMaxStepMsgBytes caps a single step message (ansible stdout).
++	DefaultMaxStepMsgBytes = 16 * 1024
++	// DefaultRetainMax is the number of terminal operations kept in memory.
++	DefaultRetainMax = 200
++	// DefaultRetentionTTL is how long a terminal operation remains queryable.
++	DefaultRetentionTTL = time.Hour
++	// DefaultTombstoneMax bounds the ring of evicted IDs that still answer
++	// 410 instead of 404.
++	DefaultTombstoneMax = 256
++	// journalBytesCap bounds the replay journal payload memory per operation
++	// (500 steps × a few hundred bytes typical); oversized single steps are
++	// still retained as the newest event, mirroring Journal semantics.
++	journalBytesCap = 512 * 1024
++
++	serverIDBytes = 12 // 24 hex chars, matching jobs.ID style
++)
++
++// Config holds the bounded-history parameters of a Manager.
++type Config struct {
++	MaxStepsPerOperation int
++	MaxStepMsgBytes      int
++	RetainMax            int
++	RetentionTTL         time.Duration
++	TombstoneMax         int
++}
++
++// DefaultConfig returns the production retention settings.
++func DefaultConfig() Config {
++	return Config{
++		MaxStepsPerOperation: DefaultMaxStepsPerOperation,
++		MaxStepMsgBytes:      DefaultMaxStepMsgBytes,
++		RetainMax:            DefaultRetainMax,
++		RetentionTTL:         DefaultRetentionTTL,
++		TombstoneMax:         DefaultTombstoneMax,
++	}
++}
++
++func (c Config) withDefaults() Config {
++	d := DefaultConfig()
++	if c.MaxStepsPerOperation <= 0 {
++		c.MaxStepsPerOperation = d.MaxStepsPerOperation
++	}
++	if c.MaxStepMsgBytes <= 0 {
++		c.MaxStepMsgBytes = d.MaxStepMsgBytes
++	}
++	if c.RetainMax <= 0 {
++		c.RetainMax = d.RetainMax
++	}
++	if c.RetentionTTL <= 0 {
++		c.RetentionTTL = d.RetentionTTL
++	}
++	if c.TombstoneMax <= 0 {
++		c.TombstoneMax = d.TombstoneMax
++	}
++	return c
++}
++
++// StartOutcome tells an API caller whether Start created a new operation or
++// resolved a replayed (idempotent) request.
++type StartOutcome int
++
++const (
++	StartCreated StartOutcome = iota
++	StartReplayRunning
++	StartReplayTerminal
++)
++
++// tombstone records an evicted operation ID so callers get a definitive 410
++// ("existed, now gone") rather than a 404 ("never seen").
++type tombstone struct {
++	id       string
++	prunedAt time.Time
++}
++
++// Manager owns live, retained and tombstoned operations. Safe for concurrent
++// use.
++type Manager struct {
++	cfg Config
++	now func() time.Time
++
++	mu         sync.Mutex
++	ops        map[string]*Operation
++	tombstones []tombstone
++
++	accepts  int64
++	finished map[Status]int64
++}
++
++// NewManager constructs a Manager with production bounds.
++func NewManager(cfg Config) *Manager {
++	return newManager(cfg, func() time.Time { return time.Now().UTC() })
++}
++
++func newManager(cfg Config, now func() time.Time) *Manager {
++	return &Manager{
++		cfg:      cfg.withDefaults(),
++		now:      now,
++		ops:      make(map[string]*Operation),
++		finished: make(map[Status]int64),
++	}
++}
++
++// clientIDRe accepts canonical op_<UUID> identifiers generated by browsers
++// (X-Operation-ID). Strict canonical shape keeps the header free-form-proof.
++var clientIDRe = regexp.MustCompile(`^op_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
++
++// ValidClientID reports whether proposedID is a syntactically acceptable
++// client-generated operation ID.
++func ValidClientID(id string) bool { return clientIDRe.MatchString(id) }
++
++func newServerID() (string, error) {
++	var b [serverIDBytes]byte
++	if _, err := rand.Read(b[:]); err != nil {
++		return "", err
++	}
++	return hex.EncodeToString(b[:]), nil
++}
++
++// Start accepts a change into the registry.
++//
++// proposedID empty → a server-generated hex ID is assigned.
++// proposedID set → it must match the canonical client shape; an existing ID
++// returns the existing operation with StartReplayRunning/StartReplayTerminal
++// and MUST NOT be executed again.
++//
++// Replaying an expired ID returns ErrExpired; a malformed ID returns
++// ErrInvalidID.
++func (m *Manager) Start(proposedID, action, target, reqID string) (*Operation, StartOutcome, error) {
++	if proposedID != "" && !ValidClientID(proposedID) {
++		return nil, 0, ErrInvalidID
++	}
++
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	m.evictExpiredLocked()
++
++	if proposedID != "" {
++		if _, buried := m.tombstoneIndexLocked(proposedID); buried {
++			return nil, 0, ErrExpired
++		}
++		if existing, ok := m.ops[proposedID]; ok {
++			if existing.Snapshot().Status.Terminal() {
++				return existing, StartReplayTerminal, nil
++			}
++			return existing, StartReplayRunning, nil
++		}
++	}
++
++	id := proposedID
++	if id == "" {
++		var err error
++		id, err = newServerID()
++		if err != nil {
++			return nil, 0, err
++		}
++	}
++
++	now := m.now()
++	op := &Operation{
++		rec: Record{
++			ID:        id,
++			Action:    action,
++			Target:    target,
++			ReqID:     reqID,
++			Status:    StatusRunning,
++			Steps:     []Step{},
++			StartedAt: now,
++		},
++		outcome: "",
++		journal: broker.NewJournal(m.cfg.MaxStepsPerOperation, journalBytesCap),
++		done:    make(chan struct{}),
++		started: now,
++	}
++	m.ops[id] = op
++	m.accepts++
++
++	slog.Info("operation accepted",
++		"op_id", id, "req_id", reqID, "action", action, "target", target)
++	return op, StartCreated, nil
++}
++
++// Get returns the operation for id, or ErrExpired/ErrNotFound.
++func (m *Manager) Get(id string) (*Operation, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	m.evictExpiredLocked()
++	if _, buried := m.tombstoneIndexLocked(id); buried {
++		return nil, ErrExpired
++	}
++	if op, ok := m.ops[id]; ok {
++		return op, nil
++	}
++	if !validLookupID(id) {
++		return nil, ErrInvalidID
++	}
++	return nil, ErrNotFound
++}
++
++// validLookupID accepts either client UUID IDs or server-generated 24-hex IDs.
++func validLookupID(id string) bool {
++	if ValidClientID(id) {
++		return true
++	}
++	if len(id) != 2*serverIDBytes {
++		return false
++	}
++	for _, c := range id {
++		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
++			return false
++		}
++	}
++	return true
++}
++
++// complete is called by an operation's response finaliser: it freezes the
++// terminal state, updates counters and runs retention pruning.
++func (m *Manager) complete(op *Operation, httpStatus int) {
++	now := m.now()
++	if !op.finish(httpStatus, now) {
++		return // already terminal
++	}
++	rec := op.Snapshot()
++
++	m.mu.Lock()
++	m.finished[rec.Status]++
++	m.pruneLocked(now)
++	m.mu.Unlock()
++}
++
++// pruneLocked evicts terminal operations beyond RetainMax (oldest first) and
++// any terminal operation older than RetentionTTL. Running operations are
++// never evicted. Evicted IDs enter the bounded tombstone ring.
++func (m *Manager) pruneLocked(now time.Time) {
++	type item struct {
++		id string
++		at time.Time
++	}
++	var terminals []item
++	for id, op := range m.ops {
++		rec := op.Snapshot()
++		if rec.Status.Terminal() {
++			terminals = append(terminals, item{id, rec.FinishedAt})
++		}
++	}
++	// Fast path: within the count cap and nothing TTL-expired.
++	overCount := len(terminals) > m.cfg.RetainMax
++	if !overCount {
++		stale := false
++		for _, it := range terminals {
++			if now.Sub(it.at) > m.cfg.RetentionTTL {
++				stale = true
++				break
++			}
++		}
++		if !stale {
++			return
++		}
++	}
++	// Oldest terminal first.
++	sort.Slice(terminals, func(i, j int) bool { return terminals[i].at.Before(terminals[j].at) })
++
++	evict := len(terminals) - m.cfg.RetainMax // must evict at least this many by count
++	for _, it := range terminals {
++		byTTL := now.Sub(it.at) > m.cfg.RetentionTTL
++		if byTTL || evict > 0 {
++			delete(m.ops, it.id)
++			m.pushTombstoneLocked(tombstone{id: it.id, prunedAt: now})
++			evict--
++		}
++	}
++}
++
++// runningCountLocked counts non-terminal operations; caller holds m.mu.
++func (m *Manager) runningCountLocked() int {
++	n := 0
++	for _, op := range m.ops {
++		if op.Snapshot().Status == StatusRunning {
++			n++
++		}
++	}
++	return n
++}
++
++// evictExpiredLocked drops tombstones older than the TTL. Terminal operations
++// past their TTL are pruned here too so lazy lookups cannot resurrect them.
++func (m *Manager) evictExpiredLocked() {
++	now := m.now()
++	kept := m.tombstones[:0]
++	for _, ts := range m.tombstones {
++		if now.Sub(ts.prunedAt) <= m.cfg.RetentionTTL {
++			kept = append(kept, ts)
++		}
++	}
++	m.tombstones = kept
++	m.pruneLocked(now)
++}
++
++func (m *Manager) pushTombstoneLocked(ts tombstone) {
++	m.tombstones = append(m.tombstones, ts)
++	if len(m.tombstones) > m.cfg.TombstoneMax {
++		copy(m.tombstones, m.tombstones[1:])
++		m.tombstones[len(m.tombstones)-1] = tombstone{}
++		m.tombstones = m.tombstones[:len(m.tombstones)-1]
++	}
++}
++
++func (m *Manager) tombstoneIndexLocked(id string) (int, bool) {
++	for i, ts := range m.tombstones {
++		if ts.id == id {
++			return i, true
++		}
++	}
++	return 0, false
++}
++
++// AddStep records a step on op applying the manager's ring/message bounds.
++func (m *Manager) AddStep(op *Operation, ts ansible.TaskStep) Step {
++	return op.AddStep(m.cfg.MaxStepsPerOperation, m.cfg.MaxStepMsgBytes, ts)
++}
++
++// Complete finalises op exactly once and runs bounded-history pruning.
++func (m *Manager) Complete(op *Operation, httpStatus int) { m.complete(op, httpStatus) }
++
++// MaxSteps returns the configured per-operation step ring size (used by
++// Operation.AddStep via the API wiring).
++func (m *Manager) MaxSteps() int { return m.cfg.MaxStepsPerOperation }
++
++// MaxStepMsgBytes returns the configured per-step message byte cap.
++func (m *Manager) MaxStepMsgBytes() int { return m.cfg.MaxStepMsgBytes }
++
++// RunningCount returns the number of currently non-terminal operations
++// (metrics gauge backing).
++func (m *Manager) RunningCount() int {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.runningCountLocked()
++}
++
++// FinishedCount returns the cumulative number of finalised operations by
++// terminal status.
++func (m *Manager) FinishedCount() map[Status]int64 {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	out := make(map[Status]int64, len(m.finished))
++	for k, v := range m.finished {
++		out[k] = v
++	}
++	return out
++}
++
++// AcceptedCount returns the cumulative number of accepted operations.
++func (m *Manager) AcceptedCount() int64 {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.accepts
++}
+diff --git a/internal/operations/manager_test.go b/internal/operations/manager_test.go
+new file mode 100644
+index 0000000..dc0da24
+--- /dev/null
++++ b/internal/operations/manager_test.go
+@@ -0,0 +1,323 @@
++package operations
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"dumpstore/internal/ansible"
++)
++
++func testConfig() Config {
++	return Config{
++		MaxStepsPerOperation: 8,
++		MaxStepMsgBytes:      32,
++		RetainMax:            5,
++		RetentionTTL:         time.Hour,
++		TombstoneMax:         3,
++	}
++}
++
++// fakeClock returns a controllable time source.
++type fakeClock struct{ t time.Time }
++
++func newTestManager(cfg Config) (*Manager, *fakeClock) {
++	clk := &fakeClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
++	return newManager(cfg, func() time.Time { return clk.t }), clk
++}
++
++func validClientID(n int) string {
++	return fmt.Sprintf("op_00000000-0000-0000-0000-%012x", n)
++}
++
++func step(name, status string) ansible.TaskStep {
++	return ansible.TaskStep{Name: name, Status: status, Msg: "ok"}
++}
++
++func TestStartAssignsIDsAndRejectsBadID(t *testing.T) {
++	m, _ := newTestManager(testConfig())
++
++	op, outcome, err := m.Start("", "dataset.create", "tank/x", "req-1")
++	if err != nil || outcome != StartCreated {
++		t.Fatalf("server id start: op=%v outcome=%v err=%v", op, outcome, err)
++	}
++	if len(op.ID()) != 24 {
++		t.Fatalf("server id = %q, want 24 hex chars", op.ID())
++	}
++
++	cid := validClientID(1)
++	op2, outcome, err := m.Start(cid, "dataset.create", "tank/y", "req-2")
++	if err != nil || outcome != StartCreated || op2.ID() != cid {
++		t.Fatalf("client id start: %v %v %v", op2, outcome, err)
++	}
++
++	if _, _, err := m.Start("op_guess", "a", "b", ""); !errors.Is(err, ErrInvalidID) {
++		t.Fatalf("bad id err = %v, want ErrInvalidID", err)
++	}
++}
++
++func TestStartIdempotentDoesNotReexecute(t *testing.T) {
++	m, clk := newTestManager(testConfig())
++	cid := validClientID(7)
++
++	op1, o1, err := m.Start(cid, "user.create", "alice", "r1")
++	if err != nil || o1 != StartCreated {
++		t.Fatalf("first start: %v %v", o1, err)
++	}
++	executions := 0
++	m.AddStep(op1, step("create user", "changed"))
++	executions++
++
++	// Replayed while still running.
++	op2, o2, err := m.Start(cid, "user.create", "alice", "r2")
++	if err != nil || o2 != StartReplayRunning || op1 != op2 {
++		t.Fatalf("running replay: %p %v %v", op2, o2, err)
++	}
++
++	m.Complete(op1, 200)
++	clk.t = clk.t.Add(time.Minute)
++
++	// Replayed after terminal: same operation, still one execution.
++	op3, o3, err := m.Start(cid, "user.create", "alice", "r3")
++	if err != nil || o3 != StartReplayTerminal || op1 != op3 {
++		t.Fatalf("terminal replay: %v %v", o3, err)
++	}
++	if executions != 1 {
++		t.Fatalf("operation executed %d times, want 1", executions)
++	}
++	rec := op3.Snapshot()
++	if rec.Status != StatusSucceeded || rec.ID != cid {
++		t.Fatalf("replayed record: %+v", rec)
++	}
++}
++
++func TestAddStepGaplessSeqAndRing(t *testing.T) {
++	m, _ := newTestManager(testConfig())
++	op, _, _ := m.Start(validClientID(2), "x", "", "")
++	for i := 0; i < 20; i++ {
++		m.AddStep(op, step(fmt.Sprintf("task %d", i), "changed"))
++	}
++	rec := op.Snapshot()
++	if rec.SeqLast != 20 {
++		t.Fatalf("SeqLast = %d, want 20", rec.SeqLast)
++	}
++	if len(rec.Steps) != 8 {
++		t.Fatalf("ring retained %d, want 8", len(rec.Steps))
++	}
++	if rec.SeqFirst != 13 || rec.Steps[0].Seq != 13 || rec.Steps[7].Seq != 20 {
++		t.Fatalf("ring window: first=%d steps=%v", rec.SeqFirst, rec.Steps)
++	}
++	// Every step seq gapless in its time: assert published journal saw 1..20
++	events, latest := op.Journal().Replay(0)
++	if latest != 20 || len(events) != 8 {
++		t.Fatalf("journal latest=%d retained=%d", latest, len(events))
++	}
++}
++
++func TestAddStepTruncatesMessage(t *testing.T) {
++	m, _ := newTestManager(testConfig())
++	op, _, _ := m.Start(validClientID(3), "x", "", "")
++	m.AddStep(op, ansible.TaskStep{Name: "big", Status: "changed", Msg: strings.Repeat("x", 200)})
++	rec := op.Snapshot()
++	if len(rec.Steps[0].Msg) > 32 || !strings.HasSuffix(rec.Steps[0].Msg, "…") {
++		t.Fatalf("truncation: %q (%d bytes)", rec.Steps[0].Msg, len(rec.Steps[0].Msg))
++	}
++}
++
++func TestFinishStatesAndPrecedence(t *testing.T) {
++	m, _ := newTestManager(testConfig())
++
++	// Failed then timeout → timeout wins.
++	op, _, _ := m.Start(validClientID(4), "a", "", "")
++	op.MarkFailure("boom")
++	op.MarkTimeout("deadline")
++	m.Complete(op, 500)
++	if got := op.Snapshot().Status; got != StatusTimeout {
++		t.Fatalf("status = %s, want timeout", got)
++	}
++	if op.Snapshot().Error != "deadline" {
++		t.Fatalf("error = %q", op.Snapshot().Error)
++	}
++
++	// Timeout then failure → timeout retained.
++	op2, _, _ := m.Start(validClientID(5), "b", "", "")
++	op2.MarkTimeout("late")
++	op2.MarkFailure("boom")
++	m.Complete(op2, 500)
++	if got := op2.Snapshot().Status; got != StatusTimeout {
++		t.Fatalf("status = %s, want timeout", got)
++	}
++
++	// Plain failure.
++	op3, _, _ := m.Start(validClientID(6), "c", "", "")
++	op3.MarkFailure("nope")
++	m.Complete(op3, 500)
++	if got := op3.Snapshot().Status; got != StatusFailed {
++		t.Fatalf("status = %s, want failed", got)
++	}
++
++	// Success inferred from 2xx.
++	op4, _, _ := m.Start(validClientID(8), "d", "", "")
++	m.Complete(op4, 200)
++	if got := op4.Snapshot().Status; got != StatusSucceeded {
++		t.Fatalf("status = %s, want succeeded", got)
++	}
++
++	// Finish is idempotent.
++	m.Complete(op4, 500)
++	if got := op4.Snapshot().Status; got != StatusSucceeded {
++		t.Fatalf("second Complete changed status to %s", got)
++	}
++	if op4.Snapshot().FinishedAt.IsZero() {
++		t.Fatal("FinishedAt not set")
++	}
++	select {
++	case <-op4.Done():
++	default:
++		t.Fatal("Done channel not closed after finish")
++	}
++}
++
++func TestGetNotFoundExpiredAndTombstone(t *testing.T) {
++	cfg := testConfig()
++	cfg.RetainMax = 1
++	cfg.TombstoneMax = 2
++	m, clk := newTestManager(cfg)
++
++	// Unknown valid ID → not found; malformed lookup → invalid.
++	if _, err := m.Get(validClientID(99)); !errors.Is(err, ErrNotFound) {
++		t.Fatalf("unknown id: %v", err)
++	}
++	if _, err := m.Get("not-an-id"); !errors.Is(err, ErrInvalidID) {
++		t.Fatalf("bad lookup: %v", err)
++	}
++
++	// Finish two terminals; RetainMax=1 evicts the oldest to tombstone.
++	op1, _, _ := m.Start(validClientID(10), "a", "", "")
++	m.Complete(op1, 200)
++	clk.t = clk.t.Add(time.Minute)
++	op2, _, _ := m.Start(validClientID(11), "b", "", "")
++	m.Complete(op2, 200)
++
++	if _, err := m.Get(validClientID(10)); !errors.Is(err, ErrExpired) {
++		t.Fatalf("pruned op: %v", err)
++	}
++	if _, _, err := m.Start(validClientID(10), "a", "", ""); !errors.Is(err, ErrExpired) {
++		t.Fatalf("replay pruned id: %v", err)
++	}
++	if op, err := m.Get(validClientID(11)); err != nil || op == nil {
++		t.Fatalf("retained op: %v", err)
++	}
++
++	// After TTL the tombstone itself expires → not found.
++	clk.t = clk.t.Add(2 * time.Hour)
++	if _, err := m.Get(validClientID(10)); !errors.Is(err, ErrNotFound) {
++		t.Fatalf("expired tombstone: %v", err)
++	}
++}
++
++func TestBoundedRetentionUnderLoad(t *testing.T) {
++	cfg := testConfig()
++	cfg.RetainMax = 200
++	cfg.TombstoneMax = 256
++	m, clk := newTestManager(cfg)
++
++	for i := 0; i < 10_000; i++ {
++		op, _, err := m.Start("", "x", "", "")
++		if err != nil {
++			t.Fatal(err)
++		}
++		m.Complete(op, 200)
++		if i%97 == 0 {
++			clk.t = clk.t.Add(time.Second)
++		}
++	}
++
++	m.mu.Lock()
++	live := len(m.ops)
++	tomb := len(m.tombstones)
++	running := m.runningCountLocked()
++	m.mu.Unlock()
++
++	if running != 0 {
++		t.Fatalf("running = %d, want 0", running)
++	}
++	if live > cfg.RetainMax {
++		t.Fatalf("live terminals = %d, cap %d", live, cfg.RetainMax)
++	}
++	if tomb > cfg.TombstoneMax {
++		t.Fatalf("tombstones = %d, cap %d", tomb, cfg.TombstoneMax)
++	}
++	if m.AcceptedCount() != 10_000 {
++		t.Fatalf("accepted = %d", m.AcceptedCount())
++	}
++}
++
++func TestSubscribeReplayLiveAndTerminal(t *testing.T) {
++	m, _ := newTestManager(testConfig())
++	op, _, _ := m.Start(validClientID(12), "x", "", "")
++	m.AddStep(op, step("a", "changed"))
++	m.AddStep(op, step("b", "changed"))
++
++	initial, ch, latest := op.Journal().Subscribe(1)
++	if latest != 2 || len(initial) != 1 || initial[0].Seq != 2 {
++		t.Fatalf("replay: latest=%d initial=%v", latest, initial)
++	}
++	m.AddStep(op, step("c", "changed"))
++	select {
++	case ev := <-ch:
++		if ev.Seq != 3 {
++			t.Fatalf("live seq = %d", ev.Seq)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("live event not delivered")
++	}
++
++	m.Complete(op, 200)
++	select {
++	case <-op.Done():
++	case <-time.After(time.Second):
++		t.Fatal("Done not closed")
++	}
++	if !op.Journal().Closed() {
++		t.Fatal("journal not sealed after finish")
++	}
++	// Late subscription replays terminal window.
++	late, _, latest := op.Journal().Subscribe(0)
++	if len(late) != 3 || latest != 3 {
++		t.Fatalf("late replay: %v latest=%d", late, latest)
++	}
++	op.Journal().Unsubscribe(ch)
++}
++
++func TestConcurrentStartSameID(t *testing.T) {
++	m, _ := newTestManager(testConfig())
++	cid := validClientID(42)
++	const n = 50
++	var wg sync.WaitGroup
++	created := 0
++	var mu sync.Mutex
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			_, outcome, err := m.Start(cid, "x", "", "")
++			if err != nil {
++				t.Errorf("start: %v", err)
++				return
++			}
++			if outcome == StartCreated {
++				mu.Lock()
++				created++
++				mu.Unlock()
++			}
++		}()
++	}
++	wg.Wait()
++	if created != 1 {
++		t.Fatalf("created %d operations for one ID, want 1", created)
++	}
++}
+diff --git a/internal/operations/metrics.go b/internal/operations/metrics.go
+new file mode 100644
+index 0000000..19a5456
+--- /dev/null
++++ b/internal/operations/metrics.go
+@@ -0,0 +1,32 @@
++package operations
++
++import (
++	"fmt"
++	"io"
++)
++
++// EmitMetrics writes operation counters/gauges in Prometheus text exposition
++// format to w. The status label cardinality is fixed to the three terminal
++// states.
++func (m *Manager) EmitMetrics(w io.Writer) {
++	accepted := m.AcceptedCount()
++	finished := m.FinishedCount()
++	running := m.RunningCount()
++
++	fmt.Fprintf(w,
++		"# HELP dumpstore_operations_accepted_total Total change operations accepted by the API.\n"+
++			"# TYPE dumpstore_operations_accepted_total counter\n"+
++			"dumpstore_operations_accepted_total %d\n", accepted)
++
++	fmt.Fprint(w,
++		"# HELP dumpstore_operations_finished_total Operations finalised, by terminal status.\n"+
++			"# TYPE dumpstore_operations_finished_total counter\n")
++	for _, s := range []Status{StatusSucceeded, StatusFailed, StatusTimeout} {
++		fmt.Fprintf(w, "dumpstore_operations_finished_total{status=%q} %d\n", s, finished[s])
++	}
++
++	fmt.Fprintf(w,
++		"# HELP dumpstore_operations_running Operations currently executing.\n"+
++			"# TYPE dumpstore_operations_running gauge\n"+
++			"dumpstore_operations_running %d\n", running)
++}
+diff --git a/internal/operations/operation.go b/internal/operations/operation.go
+new file mode 100644
+index 0000000..9d3a3cc
+--- /dev/null
++++ b/internal/operations/operation.go
+@@ -0,0 +1,225 @@
++// Package operations owns the lifecycle of API-accepted change operations.
++//
++// Every mutating request that passes validation is assigned a stable
++// operation ID before execution starts. Both execution lanes (Ansible
++// playbooks and the in-process ops runner) append ordered, sequence-numbered
++// steps to the same operation, which ends in exactly one terminal state:
++// succeeded, failed, or timeout. The state is queryable by ID and
++// subscribable (see broker.Journal) so browsers can isolate progress per
++// request and resume after reconnects.
++//
++// History is bounded and in-memory only; see Config.
++package operations
++
++import (
++	"errors"
++	"log/slog"
++	"sync"
++	"time"
++
++	"dumpstore/internal/ansible"
++	"dumpstore/internal/broker"
++)
++
++// Status is the lifecycle state of an Operation.
++type Status string
++
++const (
++	StatusRunning   Status = "running"
++	StatusSucceeded Status = "succeeded"
++	StatusFailed    Status = "failed"
++	StatusTimeout   Status = "timeout"
++)
++
++// Terminal reports whether s is an end state.
++func (s Status) Terminal() bool {
++	switch s {
++	case StatusSucceeded, StatusFailed, StatusTimeout:
++		return true
++	}
++	return false
++}
++
++// Step is one executed command/task within an operation. Seq is unique and
++// gapless within the operation starting at 1; Name/Status/Msg mirror
++// ansible.TaskStep so the frontend op-log renders unchanged.
++type Step struct {
++	Seq    int64  `json:"seq"`
++	Name   string `json:"name"`
++	Status string `json:"status"`
++	Msg    string `json:"msg,omitempty"`
++}
++
++// Record is the serialisable, queryable state of an operation.
++type Record struct {
++	ID         string    `json:"operation_id"`
++	Action     string    `json:"action"`
++	Target     string    `json:"target,omitempty"`
++	ReqID      string    `json:"req_id,omitempty"`
++	Status     Status    `json:"status"`
++	SeqFirst   int64     `json:"seq_first"`
++	SeqLast    int64     `json:"seq_last"`
++	Steps      []Step    `json:"steps"`
++	Error      string    `json:"error,omitempty"`
++	StartedAt  time.Time `json:"started_at"`
++	FinishedAt time.Time `json:"finished_at,omitempty"`
++}
++
++// Operation is a single accepted change with its step ring, terminal state
++// and replay journal. Safe for concurrent use.
++type Operation struct {
++	mu         sync.Mutex
++	rec        Record
++	outcome    Status // strongest failure marked by execution lanes
++	errMsg     string
++	journal    *broker.Journal
++	finishOnce sync.Once
++	done       chan struct{}
++	started    time.Time
++}
++
++// Snapshot returns an independent copy of the operation's current record.
++func (o *Operation) Snapshot() Record {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	cp := o.rec
++	cp.Steps = append([]Step(nil), o.rec.Steps...)
++	return cp
++}
++
++// Journal exposes the replay journal backing the operation's SSE stream.
++func (o *Operation) Journal() *broker.Journal { return o.journal }
++
++// Done is closed once the operation reaches its terminal state.
++func (o *Operation) Done() <-chan struct{} { return o.done }
++
++// ID returns the operation identifier.
++func (o *Operation) ID() string {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	return o.rec.ID
++}
++
++// AddStep records one completed execution step, assigning the next gapless
++// sequence number, truncating an oversized message and evicting the oldest
++// retained steps beyond the ring cap. The step is also published live to the
++// replay journal.
++func (o *Operation) AddStep(maxSteps int, maxMsgBytes int, ts ansible.TaskStep) Step {
++	o.mu.Lock()
++	msg := truncateMsg(ts.Msg, maxMsgBytes)
++	o.rec.SeqLast++
++	step := Step{Seq: o.rec.SeqLast, Name: ts.Name, Status: ts.Status, Msg: msg}
++	o.rec.Steps = append(o.rec.Steps, step)
++	if len(o.rec.Steps) > maxSteps {
++		drop := len(o.rec.Steps) - maxSteps
++		copy(o.rec.Steps, o.rec.Steps[drop:])
++		for i := len(o.rec.Steps) - drop; i < len(o.rec.Steps); i++ {
++			o.rec.Steps[i] = Step{}
++		}
++		o.rec.Steps = o.rec.Steps[:len(o.rec.Steps)-drop]
++	}
++	o.rec.SeqFirst = o.rec.Steps[0].Seq
++	journal := o.journal
++	id := o.rec.ID
++	o.mu.Unlock()
++
++	slog.Debug("operation step", "op_id", id, "seq", step.Seq,
++		"name", step.Name, "status", step.Status)
++	if _, err := journal.Publish(step); err != nil {
++		slog.Warn("operation: journal publish failed", "op_id", id, "seq", step.Seq, "err", err)
++	}
++	return step
++}
++
++// MarkFailure records a non-timeout execution failure. A previously marked
++// timeout is not downgraded.
++func (o *Operation) MarkFailure(msg string) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if o.outcome == "" {
++		o.outcome = StatusFailed
++		o.errMsg = msg
++	}
++}
++
++// MarkTimeout records a timeout, which takes precedence over an ordinary
++// failure even when multiple executions share one operation.
++func (o *Operation) MarkTimeout(msg string) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	o.outcome = StatusTimeout
++	o.errMsg = msg
++}
++
++// finish freezes the terminal state exactly once. httpStatus is the status
++// written to the accepting HTTP response (used as a fallback when an
++// execution lane forgot to mark an outcome). Returns true on the first call.
++func (o *Operation) finish(httpStatus int, now time.Time) bool {
++	finalized := false
++	o.finishOnce.Do(func() {
++		finalized = true
++		o.mu.Lock()
++		status := o.outcome
++		if status == "" {
++			if httpStatus >= 400 {
++				status = StatusFailed
++			} else {
++				status = StatusSucceeded
++			}
++		}
++		o.rec.Status = status
++		o.rec.Error = o.errMsg
++		o.rec.FinishedAt = now
++		finishedAt := now
++		errMsg := o.errMsg
++		o.mu.Unlock()
++
++		o.journal.Close()
++		close(o.done)
++
++		args := []any{
++			"op_id", o.rec.ID, "status", status,
++			"duration_ms", finishedAt.Sub(o.started).Milliseconds(),
++			"failed", status != StatusSucceeded,
++		}
++		if errMsg != "" {
++			args = append(args, "error", errMsg)
++		}
++		slog.Info("operation finished", args...)
++	})
++	return finalized
++}
++
++// truncateMsg caps msg to maxBytes (UTF-8 safe boundary), appending an
++// ellipsis when something was dropped. Empty/short input is returned as-is.
++func truncateMsg(msg string, maxBytes int) string {
++	if len(msg) <= maxBytes {
++		return msg
++	}
++	if maxBytes <= 4 {
++		// Too small to keep any content plus the ellipsis.
++		return "…"
++	}
++	cut := maxBytes - 3 // reserve space for "…" (3 bytes)
++	for cut > 0 && !utf8RuneStart(msg[cut]) {
++		cut--
++	}
++	if cut <= 0 {
++		return "…"
++	}
++	return msg[:cut] + "…"
++}
++
++func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
++
++// ErrAlready* classification helpers reused by the API layer.
++var (
++	// ErrInvalidID means a client-supplied operation ID failed the syntax check.
++	ErrInvalidID = errors.New("invalid operation id")
++	// ErrNotFound means the ID is syntactically valid but no live or retained
++	// operation is known for it (and no tombstone records it either).
++	ErrNotFound = errors.New("operation not found")
++	// ErrExpired means the operation existed, finished and has since been
++	// evicted from bounded history; its result is not recoverable.
++	ErrExpired = errors.New("operation expired")
++)
+diff --git a/internal/ops/ops.go b/internal/ops/ops.go
+index ef8dad0..ab7f58a 100644
+--- a/internal/ops/ops.go
++++ b/internal/ops/ops.go
+@@ -3,9 +3,10 @@
+ // It replaces Ansible for mutations that are just "assert inputs, run one
+ // argv command" (zpool scrub/replace/add/…, zfs snapshot/destroy/set) —
+ // see issue #115. Input validation lives in the API handlers; commands run
+-// argv-style with no shell. Step results use the exact ansible.TaskStep
+-// shape so the frontend op-log dialog and the ansible.progress SSE topic
+-// work unchanged.
++// argv-style with no shell. Step results use the ansible.TaskStep shape and
++// are appended to the request's tracked internal/operations record (gapless
++// sequence, single terminal state, per-operation resumable SSE), so the
++// frontend op-log dialog renders this lane and the Ansible lane identically.
+ //
+ // Ansible remains the write path for config-file ownership (smb.conf),
+ // service state, and OS resources (users/groups); long-running data-plane
+@@ -14,6 +15,7 @@ package ops
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"os/exec"
+ 	"strings"
+@@ -31,6 +33,11 @@ import (
+ // is installed at startup.
+ var tracer = otel.Tracer("dumpstore")
+ 
++// ErrTimedOut wraps the error returned when a step's command does not finish
++// within the runner's per-step timeout. Callers classify the operation
++// terminal state with errors.Is(err, ErrTimedOut).
++var ErrTimedOut = errors.New("ops step timed out")
++
+ // allowedBinaries is the closed set of binaries the ops layer may execute.
+ // Handlers build steps from hardcoded argv literals; this check makes
+ // binary substitution structurally impossible even if a future call site
+@@ -57,6 +64,10 @@ type Result struct {
+ // Steps returns the ordered step results.
+ func (r *Result) Steps() []ansible.TaskStep { return r.steps }
+ 
++// NewResult builds a result from steps. It exists so non-runner code (tests,
++// fakes) can construct a result value.
++func NewResult(steps []ansible.TaskStep) *Result { return &Result{steps: steps} }
++
+ // Runner executes Steps sequentially with a per-step timeout.
+ type Runner struct {
+ 	Timeout time.Duration
+@@ -76,6 +87,7 @@ func NewRunner() *Runner {
+ func (r *Runner) Run(ctx context.Context, steps []Step, onStep func(ansible.TaskStep)) (*Result, error) {
+ 	res := &Result{}
+ 	var failed []string
++	var failedErrs []error
+ 	for _, st := range steps {
+ 		ts, err := r.runStep(ctx, st)
+ 		res.steps = append(res.steps, ts)
+@@ -84,14 +96,17 @@ func (r *Runner) Run(ctx context.Context, steps []Step, onStep func(ansible.Task
+ 		}
+ 		if err != nil {
+ 			failed = append(failed, fmt.Sprintf("%s (%s)", st.Name, ts.Msg))
++			failedErrs = append(failedErrs, err)
+ 			if !st.ContinueOnError {
+ 				break
+ 			}
+ 		}
+ 	}
+ 	if len(failed) > 0 {
+-		return res, fmt.Errorf("%d of %d step(s) failed: %s",
+-			len(failed), len(res.steps), strings.Join(failed, "; "))
++		// Wrap the underlying step errors (joined) in addition to the human
++		// summary so errors.Is(err, ErrTimedOut) still reaches the cause.
++		return res, fmt.Errorf("%d of %d step(s) failed: %s: %w",
++			len(failed), len(res.steps), strings.Join(failed, "; "), errors.Join(failedErrs...))
+ 	}
+ 	return res, nil
+ }
+@@ -119,6 +134,21 @@ func (r *Runner) runStep(ctx context.Context, st Step) (ansible.TaskStep, error)
+ 	out, err := exec.CommandContext(ctx, st.Argv[0], st.Argv[1:]...).CombinedOutput()
+ 	r.metrics.record(opLabel(st.Argv), time.Since(start), err != nil)
+ 
++	// Timeout takes precedence over the generic exit error so callers can
++	// classify the operation terminal state via errors.Is(err, ErrTimedOut).
++	if ctx.Err() == context.DeadlineExceeded {
++		msg := strings.TrimSpace(string(out))
++		if msg == "" {
++			msg = fmt.Sprintf("timed out after %s", r.Timeout)
++		}
++		ts := ansible.TaskStep{Name: st.Name, Status: "failed", Msg: msg}
++		stepErr := fmt.Errorf("%w: %s: step %q after %s",
++			ErrTimedOut, strings.Join(st.Argv, " "), st.Name, r.Timeout)
++		span.RecordError(stepErr)
++		span.SetStatus(codes.Error, msg)
++		return ts, stepErr
++	}
++
+ 	msg := strings.TrimSpace(string(out))
+ 	ts := ansible.TaskStep{Name: st.Name, Status: "changed", Msg: msg}
+ 	if err != nil {
+diff --git a/internal/ops/ops_test.go b/internal/ops/ops_test.go
+index 275426e..698cdd6 100644
+--- a/internal/ops/ops_test.go
++++ b/internal/ops/ops_test.go
+@@ -2,8 +2,10 @@ package ops
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"dumpstore/internal/ansible"
+ )
+@@ -113,3 +115,39 @@ func TestRunRejectsUnlistedBinary(t *testing.T) {
+ 		t.Errorf("unlisted binary step: %+v", steps)
+ 	}
+ }
++
++func TestRunTimeoutWrapsSentinel(t *testing.T) {
++	allowForTest(t, "sleep")
++	r := NewRunner()
++	r.Timeout = 20 * time.Millisecond
++	res, err := r.Run(context.Background(), []Step{
++		{Name: "slow command", Argv: []string{"sleep", "2"}},
++	}, nil)
++	if err == nil {
++		t.Fatal("expected timeout error")
++	}
++	if !errors.Is(err, ErrTimedOut) {
++		t.Fatalf("errors.Is(err, ErrTimedOut) = false; err=%v", err)
++	}
++	if !strings.Contains(err.Error(), "20ms") {
++		t.Fatalf("error should carry the timeout duration: %v", err)
++	}
++	steps := res.Steps()
++	if len(steps) != 1 || steps[0].Status != "failed" {
++		t.Fatalf("timeout step: %+v", steps)
++	}
++}
++
++func TestRunOrdinaryFailureIsNotTimeout(t *testing.T) {
++	allowForTest(t, "false")
++	r := NewRunner()
++	_, err := r.Run(context.Background(), []Step{
++		{Name: "fail", Argv: []string{"false"}},
++	}, nil)
++	if err == nil {
++		t.Fatal("expected error")
++	}
++	if errors.Is(err, ErrTimedOut) {
++		t.Fatalf("plain failure must not classify as timeout: %v", err)
++	}
++}
+diff --git a/main.go b/main.go
+index 4536a7a..585191e 100644
+--- a/main.go
++++ b/main.go
+@@ -24,6 +24,7 @@ import (
+ 	"dumpstore/internal/broker"
+ 	"dumpstore/internal/jobs"
+ 	"dumpstore/internal/logging"
++	"dumpstore/internal/operations"
+ 	otelx "dumpstore/internal/otel"
+ 	"dumpstore/internal/platform"
+ 	"dumpstore/internal/replication"
+@@ -144,6 +145,8 @@ func main() {
+ 		os.Exit(1)
+ 	}
+ 
++	opMgr := operations.NewManager(operations.DefaultConfig())
++
+ 	sched := scheduler.New()
+ 	replStore, err := replication.NewStore(platform.StateDir(runtime.GOOS))
+ 	if err != nil {
+@@ -174,7 +177,7 @@ func main() {
+ 	sched.Start(ctx)
+ 	defer sched.Stop()
+ 
+-	apiHandler := api.NewHandler(runner, version, b, jobMgr, replRunner, autosnapRunner, cfg, store, *configPath)
++	apiHandler := api.NewHandler(runner, version, b, jobMgr, replRunner, autosnapRunner, cfg, store, *configPath, opMgr)
+ 	apiHandler.SetOtelInfo(otelx.Status())
+ 
+ 	mux := http.NewServeMux()
+diff --git a/static/app.js b/static/app.js
+index b71bc49..4c655d5 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -233,10 +233,11 @@ async function tlsAcmeRenew() {
+ // If SSE is unavailable, startPolling() is called from the onerror handler.
+ //
+ // Safety-net: re-fetch all REST state every 60 s regardless of SSE health.
+-// SSE events can be silently dropped when the subscriber channel is full
+-// (broker logs "subscriber slow, dropping message"). When that happens the
+-// poller will not re-publish if the underlying data has not changed, leaving
+-// the browser permanently stale. This interval guarantees recovery.
++// A cache topic event can be silently dropped when the subscriber channel is
++// full (broker logs "subscriber slow, closing connection"); the poller then
++// will not re-publish if the underlying data has not changed, leaving the
++// browser stale. Operation progress is unaffected — its per-operation stream
++// replays gaps on reconnect — but this interval guarantees cache recovery.
+ setInterval(loadAll, 60_000);
+ initAuthHeader();
+ initAuthConfig();
+diff --git a/static/js/loader.js b/static/js/loader.js
+index 6579ec4..1f94911 100644
+--- a/static/js/loader.js
++++ b/static/js/loader.js
+@@ -1,5 +1,5 @@
+ import { state, storeSet, storeBatch } from './store.js';
+-import { api, esc, toast, setRefreshing, appendOpLogStep, opLogDialog } from './utils.js';
++import { api, esc, toast, setRefreshing } from './utils.js';
+ import { refreshACLStatus } from './dataset-dialogs.js';
+ import { mergeJob } from './jobs.js';
+ 
+@@ -174,7 +174,10 @@ function stopPolling() {
+ 
+ export function startSSE() {
+   if (_es) { _es.close(); _es = null; }
+-  const topics = [...Object.keys(sseTopicMap), 'ansible.progress', 'jobs.update'].join(',');
++  // Per-change operation progress is delivered on operation-specific
++  // EventSource streams managed in utils.js (isolation + replay), not on
++  // this shared cache-topic connection.
++  const topics = [...Object.keys(sseTopicMap), 'jobs.update'].join(',');
+   const es = new EventSource('/api/events?topics=' + encodeURIComponent(topics));
+   _es = es;
+ 
+@@ -188,16 +191,6 @@ export function startSSE() {
+     loadAll();
+   };
+ 
+-  es.addEventListener('ansible.progress', e => {
+-    try {
+-      const step = JSON.parse(e.data);
+-      // Only append if the dialog is open and still in running state (close button disabled)
+-      if (opLogDialog.open && document.getElementById('opLogClose').disabled) {
+-        appendOpLogStep(step);
+-      }
+-    } catch (err) { console.warn('[SSE] ansible.progress parse error', err); }
+-  });
+-
+   // jobs.update publishes a single Job per event; merge into state.jobs by id.
+   es.addEventListener('jobs.update', e => {
+     try {
+diff --git a/static/js/utils.js b/static/js/utils.js
+index 36e5dd1..1984a71 100644
+--- a/static/js/utils.js
++++ b/static/js/utils.js
+@@ -8,10 +8,192 @@ export function esc(s) {
+ }
+ 
+ // ── API helpers ───────────────────────────────────────────────────────────────
++
++const OP_ID_HEADER = 'X-Operation-ID';
++
++// Lanes that do not create tracked operations (jobs data-plane and the
++// replication store/scheduler). They keep their own progress channels
++// (jobs.update) and must not open an operation event stream that can never
++// resolve.
++const OP_TRACKING_SKIP = /^\/api\/(jobs(\/|$)|replication(\/|$)|snapshots\/send\b|rewrite\/)/;
++
++// Operation progress streams keyed by operation ID. One dialog binds one ID,
++// so a second browser tab can never paint another operation's steps here.
++const opStreams = new Map();
++let dialogOpId = null; // operation currently allowed to touch the op-log dialog
++
++// generateOpId returns a client-generated operation ID. randomUUID is only
++// available in secure contexts; plain-HTTP LAN deployments fall back to an
++// RFC-4122-shaped v4 id built from getRandomValues/Math.random (uniqueness,
++// not cryptographic strength, is what idempotency needs).
++function generateOpId() {
++  const hex = n => Array.from({ length: n }, () =>
++    Math.floor(Math.random() * 16).toString(16)).join('');
++  let uuid;
++  if (window.crypto?.randomUUID) {
++    uuid = window.crypto.randomUUID();
++  } else if (window.crypto?.getRandomValues) {
++    const b = new Uint8Array(16);
++    window.crypto.getRandomValues(b);
++    b[6] = (b[6] & 0x0f) | 0x40;
++    b[8] = (b[8] & 0x3f) | 0x80;
++    const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
++    uuid = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
++  } else {
++    uuid = `${hex(8)}-${hex(4)}-4${hex(3)}-a${hex(3)}-${hex(12)}`;
++  }
++  return 'op_' + uuid;
++}
++
++// openOperationStream subscribes to one operation's SSE stream. It tolerates
++// the "connected before the server accepted the POST" race (404), network
++// blips and slow-consumer server closes by recreating the EventSource on a
++// short capped backoff; every (re)connection receives an op.snapshot full
++// replace, and op.step events are seq-deduped, so neither path can gap or
++// duplicate the dialog.
++function openOperationStream(opId) {
++  if (opStreams.has(opId)) return opStreams.get(opId);
++  const handle = { es: null, closed: false, fails: 0, lastSeq: 0 };
++  opStreams.set(opId, handle);
++
++  const connect = () => {
++    if (handle.closed) return;
++    const es = new EventSource(`/api/operations/${encodeURIComponent(opId)}/events`);
++    handle.es = es;
++
++    es.addEventListener('op.snapshot', e => {
++      handle.fails = 0;
++      let rec;
++      try { rec = JSON.parse(e.data); } catch { return; }
++      handle.lastSeq = rec.seq_last || 0;
++      if (dialogAccepts(opId)) renderRunningSteps(rec.steps || [], false);
++      if (rec.status && rec.status !== 'running') closeOperationStream(opId);
++    });
++    es.addEventListener('op.step', e => {
++      handle.fails = 0;
++      let step;
++      try { step = JSON.parse(e.data); } catch { return; }
++      if (!step || step.seq <= handle.lastSeq) return; // dedupe replays
++      handle.lastSeq = step.seq;
++      if (dialogAccepts(opId)) appendOpLogStep(step);
++    });
++    es.addEventListener('op.finished', () => closeOperationStream(opId));
++    es.onerror = () => {
++      if (handle.closed) return;
++      es.close();
++      handle.fails++;
++      // 404 pre-acceptance, dropped slow subscriber, proxy restart — the
++      // snapshot-on-reconnect model converges on all of them.
++      const delay = Math.min(200 * handle.fails, 3000);
++      setTimeout(connect, delay);
++    };
++  };
++  connect();
++  return handle;
++}
++
++function closeOperationStream(opId) {
++  const handle = opStreams.get(opId);
++  if (!handle) return;
++  handle.closed = true;
++  try { handle.es?.close(); } catch { /* ignore */ }
++  opStreams.delete(opId);
++}
++
++// dialogAccepts reports whether live events for opId may paint into the
++// currently open running dialog.
++function dialogAccepts(opId) {
++  return opLogDialog.open
++    && dialogOpId === opId
++    && document.getElementById('opLogClose').disabled;
++}
++
++// recoverOperation resolves an ambiguous request (POST response never
++// arrived) by querying the operation the server knows under the same ID,
++// until a terminal record appears, the operation expires, or the 1h retention
++// horizon is crossed. The dialog is driven via the same SSE stream meanwhile.
++async function recoverOperation(opId) {
++  if (dialogAccepts(opId)) renderRunningSteps(null, true);
++  const deadline = Date.now() + 65 * 60 * 1000;
++  let consecutiveNotFound = 0;
++  for (;;) {
++    await new Promise(r => setTimeout(r, 2000));
++    let rec = null;
++    let status = 0;
++    try {
++      const res = await fetch(`/api/operations/${encodeURIComponent(opId)}`);
++      status = res.status;
++      if (status === 401) { window.location.href = '/login'; throw new Error('unauthorized'); }
++      if (status === 410) {
++        // Fixed Chinese copy; the server body is only a machine-readable
++        // contract and is not user-facing text.
++        const err = new Error('操作结果已过期，不可恢复');
++        err.unrecoverable = true;
++        throw err;
++      }
++      if (res.ok) rec = await res.json();
++    } catch (e) {
++      if (e.unrecoverable) throw e;
++      // network still down — reset the not-found streak and keep waiting
++      consecutiveNotFound = 0;
++      status = 0;
++    }
++    if (rec && rec.status && rec.status !== 'running') {
++      if (rec.status === 'succeeded') return { tasks: rec.steps || [] };
++      const err = new Error(rec.error || `operation ${rec.status}`);
++      err.tasks = rec.steps || [];
++      throw err;
++    }
++    // A reachable server that has never heard of this ID means the POST did
++    // not reach acceptance (lost before the server saw it). Give it a short
++    // grace window for an in-flight request, then stop ambiguously waiting.
++    if (status === 404) {
++      consecutiveNotFound++;
++      if (consecutiveNotFound >= 30) { // ~60 s of reachable 404s
++        const err = new Error('请求未能确认：服务端没有该操作记录，请在网络恢复后检查实际状态');
++        err.unrecoverable = true;
++        throw err;
++      }
++    } else {
++      consecutiveNotFound = 0;
++    }
++    if (Date.now() > deadline) {
++      const err = new Error('操作结果已超过可恢复时限，不可恢复');
++      err.unrecoverable = true;
++      throw err;
++    }
++  }
++}
++
+ export async function api(method, path, body) {
++  const tracked = method !== 'GET' && !OP_TRACKING_SKIP.test(path);
++  const opId = tracked ? generateOpId() : null;
++  if (tracked) {
++    dialogOpId = opId;
++    openOperationStream(opId);
++  }
++
+   const opts = { method, headers: { 'Content-Type': 'application/json' } };
++  if (opId) opts.headers[OP_ID_HEADER] = opId;
+   if (body !== undefined) opts.body = JSON.stringify(body);
+-  const res = await fetch(path, opts);
++
++  let res;
++  try {
++    res = await fetch(path, opts);
++  } catch (networkErr) {
++    // Response never arrived: the change may have been accepted. Never turn
++    // this into an "unknown" error — resolve against the known operation ID.
++    if (!tracked) throw networkErr;
++    try {
++      return await recoverOperation(opId);
++    } finally {
++      closeOperationStream(opId);
++    }
++  }
++  // HTTP response received (any status): the outcome is deterministic; live
++  // streaming has served its purpose for this request.
++  closeOperationStream(opId);
++
+   if (res.status === 401) { window.location.href = '/login'; throw new Error('unauthorized'); }
+   if (res.status === 204) return null;
+   const data = await res.json();
+@@ -89,29 +271,49 @@ document.getElementById('opLogClose').addEventListener('click', () => opLogDialo
+ 
+ const stepIcons = { ok: '✓', changed: '●', failed: '✗', skipped: '–' };
+ 
++// stepHTML renders one task step identically in running snapshots and in the
++// final response-driven render.
++function stepHTML(t) {
++  return `
++    <div class="op-step ${esc(t.status)}">
++      <span class="op-step-icon">${esc(stepIcons[t.status] || '?')}</span>
++      <span class="op-step-name">${esc(t.name)}</span>
++      ${t.msg ? `<span class="op-step-msg">${esc(t.msg)}</span>` : ''}
++    </div>`;
++}
++
+ export function showOpLogRunning(title) {
+   document.getElementById('opLogTitle').textContent = title;
+-  document.getElementById('opLogSteps').innerHTML = `
+-    <div class="op-step running">
+-      <span class="op-step-icon">⟳</span>
+-      <span class="op-step-name">Running…</span>
+-    </div>`;
++  renderRunningSteps(null, false);
+   document.getElementById('opLogError').style.display = 'none';
+   document.getElementById('opLogClose').disabled = true;
+   if (!opLogDialog.open) opLogDialog.showModal();
+ }
+ 
++// renderRunningSteps replaces the dialog body while execution is in flight.
++// An empty list shows a placeholder; recovering switches its wording after a
++// lost response. The close button stays disabled until a terminal render.
++function renderRunningSteps(steps, recovering) {
++  const stepsEl = document.getElementById('opLogSteps');
++  document.getElementById('opLogError').style.display = 'none';
++  document.getElementById('opLogClose').disabled = true;
++  if (!steps || steps.length === 0) {
++    stepsEl.innerHTML = `
++      <div class="op-step running">
++        <span class="op-step-icon">⟳</span>
++        <span class="op-step-name">${recovering ? '连接中断，正在恢复结果…' : 'Running…'}</span>
++      </div>`;
++    return;
++  }
++  stepsEl.innerHTML = steps.map(stepHTML).join('');
++}
++
+ export function showOpLog(title, tasks, errorMsg) {
+   document.getElementById('opLogTitle').textContent = title;
+   const stepsEl = document.getElementById('opLogSteps');
+   const errorEl = document.getElementById('opLogError');
+ 
+-  stepsEl.innerHTML = (tasks || []).map(t => `
+-    <div class="op-step ${esc(t.status)}">
+-      <span class="op-step-icon">${esc(stepIcons[t.status] || '?')}</span>
+-      <span class="op-step-name">${esc(t.name)}</span>
+-      ${t.msg ? `<span class="op-step-msg">${esc(t.msg)}</span>` : ''}
+-    </div>`).join('');
++  stepsEl.innerHTML = (tasks || []).map(stepHTML).join('');
+ 
+   if (errorMsg) {
+     errorEl.textContent = errorMsg;
+@@ -123,11 +325,12 @@ export function showOpLog(title, tasks, errorMsg) {
+   if (!opLogDialog.open) opLogDialog.showModal();
+ }
+ 
+-// Append a single task step to the op-log while it is in running state.
+-// Removes the "Running…" placeholder on the first call.
++// appendOpLogStep appends a single tracked operation step to the running
++// dialog. Removes any placeholder on the first call. Sequence de-duplication
++// happens in the stream layer before this is called.
+ export function appendOpLogStep(step) {
+   const stepsEl = document.getElementById('opLogSteps');
+-  // Remove the "Running…" placeholder if present
++  // Remove the running/recovering placeholder if present.
+   const running = stepsEl.querySelector('.op-step.running');
+   if (running) running.remove();
+   const div = document.createElement('div');
+diff --git a/tests/integration/operations_test.go b/tests/integration/operations_test.go
+new file mode 100644
+index 0000000..37ce486
+--- /dev/null
++++ b/tests/integration/operations_test.go
+@@ -0,0 +1,365 @@
++//go:build integration
++
++package integration
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++)
++
++// opRecord is the GET /api/operations/{id} response (subset asserted on).
++type opRecord struct {
++	ID         string `json:"operation_id"`
++	Action     string `json:"action"`
++	Status     string `json:"status"`
++	SeqFirst   int64  `json:"seq_first"`
++	SeqLast    int64  `json:"seq_last"`
++	Error      string `json:"error"`
++	Steps      []struct {
++		Seq    int64  `json:"seq"`
++		Name   string `json:"name"`
++		Status string `json:"status"`
++	} `json:"steps"`
++	StartedAt  string `json:"started_at"`
++	FinishedAt string `json:"finished_at"`
++}
++
++type opReplay struct {
++	ID     string `json:"operation_id"`
++	Status string `json:"status"`
++}
++
++func opUUID(t *testing.T) string {
++	t.Helper()
++	return "op_" + strings.TrimSpace(vmExec(t, "cat /proc/sys/kernel/random/uuid"))
++}
++
++// postWithOp issues a change request carrying an operation ID, returning
++// status, body and the echoed operation header.
++func postWithOp(t *testing.T, method, path, opID string, body any) (int, []byte, string) {
++	t.Helper()
++	login(t)
++	var rdr io.Reader
++	if body != nil {
++		b, err := json.Marshal(body)
++		if err != nil {
++			t.Fatal(err)
++		}
++		rdr = bytes.NewReader(b)
++	}
++	req, err := http.NewRequest(method, baseURL+path, rdr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	if opID != "" {
++		req.Header.Set("X-Operation-ID", opID)
++	}
++	resp, err := client.Do(req)
++	if err != nil {
++		t.Fatalf("%s %s: %v", method, path, err)
++	}
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return resp.StatusCode, b, resp.Header.Get("X-Operation-ID")
++}
++
++func getOperation(t *testing.T, opID string) (int, opRecord) {
++	t.Helper()
++	status, b := api(t, "GET", "/api/operations/"+opID, nil)
++	var rec opRecord
++	if status == 200 {
++		rec = decode[opRecord](t, b)
++	}
++	return status, rec
++}
++
++// streamEvents opens the per-operation SSE stream with an optional resume
++// position and reads until the terminal record/finished event (or times out).
++func streamEvents(t *testing.T, opID, lastEventID string, timeout time.Duration) []string {
++	t.Helper()
++	login(t)
++	req, err := http.NewRequest("GET", baseURL+"/api/operations/"+opID+"/events", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if lastEventID != "" {
++		req.Header.Set("Last-Event-ID", lastEventID)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	defer cancel()
++	resp, err := client.Do(req.WithContext(ctx))
++	if err != nil {
++		t.Fatalf("GET events: %v", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != 200 {
++		t.Fatalf("events status = %d", resp.StatusCode)
++	}
++	var lines []string
++	sc := bufio.NewScanner(resp.Body)
++	sc.Buffer(make([]byte, 64*1024), 1024*1024)
++	for sc.Scan() {
++		line := sc.Text()
++		if strings.HasPrefix(line, "event: ") || strings.HasPrefix(line, "id: ") ||
++			strings.HasPrefix(line, "data: ") {
++			lines = append(lines, line)
++		}
++		// Terminal snapshot/finished data line ends the collection.
++		if strings.HasPrefix(line, "data: ") &&
++			(strings.Contains(line, `"status":"succeeded"`) ||
++				strings.Contains(line, `"status":"failed"`) ||
++				strings.Contains(line, `"status":"timeout"`)) {
++			break
++		}
++	}
++	return lines
++}
++
++// waitForTerminal polls the operation until it leaves running.
++func waitForTerminal(t *testing.T, opID string) opRecord {
++	t.Helper()
++	var rec opRecord
++	waitFor(t, "operation "+opID+" terminal", 30*time.Second, func() bool {
++		status, r := getOperation(t, opID)
++		if status != 200 {
++			return false
++		}
++		rec = r
++		return rec.Status != "running"
++	})
++	return rec
++}
++
++func TestOperationHeaderAndRecord(t *testing.T) {
++	opID := opUUID(t)
++	status, body, echo := postWithOp(t, "POST", "/api/auto-snapshot/takeover", opID, nil)
++	if status != 200 {
++		t.Fatalf("takeover status = %d: %s", status, truncate(body, 500))
++	}
++	if echo != opID {
++		t.Fatalf("X-Operation-ID echo = %q, want %q", echo, opID)
++	}
++	recStatus, rec := getOperation(t, opID)
++	if recStatus != 200 {
++		t.Fatalf("GET operation status = %d", recStatus)
++	}
++	if rec.ID != opID || rec.Action != "auto_snapshot.takeover" || rec.Status != "succeeded" {
++		t.Fatalf("record: %+v", rec)
++	}
++	if rec.SeqLast < 1 || len(rec.Steps) < 1 || rec.FinishedAt == "" {
++		t.Fatalf("record missing steps/timestamps: %+v", rec)
++	}
++	for i, s := range rec.Steps {
++		if s.Seq != rec.SeqFirst+int64(i) {
++			t.Fatalf("step %d seq = %d (seq_first=%d)", i, s.Seq, rec.SeqFirst)
++		}
++	}
++}
++
++func TestOperationFailureTerminal(t *testing.T) {
++	// A dataset under a non-existent pool passes Go validation but fails in
++	// the zfs_dataset_create playbook.
++	opID := opUUID(t)
++	status, body, echo := postWithOp(t, "POST", "/api/datasets", opID, map[string]string{
++		"name": "definitely-no-such-pool-xyz/ops-test",
++		"type": "filesystem",
++	})
++	if status != 500 {
++		t.Fatalf("expected 500, got %d: %s", status, truncate(body, 500))
++	}
++	if echo != opID {
++		t.Fatalf("failure response missing operation header")
++	}
++	rec := waitForTerminal(t, opID)
++	if rec.Status != "failed" || rec.Error == "" {
++		t.Fatalf("expected failed with error, got %+v", rec)
++	}
++}
++
++func TestOperationValidationRejectHasNoOperation(t *testing.T) {
++	// Malformed operation ID → 400, nothing accepted.
++	status, _, echo := postWithOp(t, "POST", "/api/datasets", "nonsense-id", map[string]string{
++		"name": "tank/x", "type": "filesystem",
++	})
++	if status != 400 {
++		t.Fatalf("malformed id status = %d", status)
++	}
++	if echo != "" {
++		t.Fatalf("malformed id must not echo an operation header")
++	}
++
++	// Valid ID but request fails validation → no operation is created.
++	opID := opUUID(t)
++	status, _, echo = postWithOp(t, "POST", "/api/datasets", opID, map[string]string{
++		"name": "bad name!!", "type": "filesystem",
++	})
++	if status != 400 {
++		t.Fatalf("validation status = %d", status)
++	}
++	if echo != "" {
++		t.Fatalf("rejected request must not echo an operation header")
++	}
++	if code, _ := getOperation(t, opID); code != 404 {
++		t.Fatalf("rejected request created an operation: GET status = %d", code)
++	}
++}
++
++func TestOperationReplayIsIdempotent(t *testing.T) {
++	opID := opUUID(t)
++	status, body1, _ := postWithOp(t, "POST", "/api/auto-snapshot/takeover", opID, nil)
++	if status != 200 {
++		t.Fatalf("initial: %d %s", status, truncate(body1, 300))
++	}
++	_, first := getOperation(t, opID)
++
++	status2, body2, _ := postWithOp(t, "POST", "/api/auto-snapshot/takeover", opID, nil)
++	if status2 != 200 {
++		t.Fatalf("replay status = %d", status2)
++	}
++	re := decode[opReplay](t, body2)
++	if re.ID != opID || re.Status != "succeeded" {
++		t.Fatalf("replay body: %s", truncate(body2, 300))
++	}
++	_, second := getOperation(t, opID)
++	// The frozen record is untouched by the replay (no second execution).
++	if second.StartedAt != first.StartedAt || second.FinishedAt != first.FinishedAt ||
++		second.SeqLast != first.SeqLast {
++		t.Fatalf("record changed on replay:\n%+v\n%+v", first, second)
++	}
++}
++
++func TestOperationExpired410(t *testing.T) {
++	// Default retention keeps 200 terminal operations. Create one via the
++	// Ansible lane, then flood cheap ops-lane terminal operations (repeated
++	// scrub starts against the test pool return in milliseconds — whether
++	// they succeed or fail, each is a terminal operation).
++	opID := opUUID(t)
++	if status, _, _ := postWithOp(t, "POST", "/api/auto-snapshot/takeover", opID, nil); status != 200 {
++		t.Fatalf("seed status = %d", status)
++	}
++	for i := 0; i < 201; i++ {
++		code, _ := api(t, "POST", "/api/scrub/"+testPool, nil)
++		if code != 200 && code != 500 {
++			t.Fatalf("flood %d unexpected status = %d", i, code)
++		}
++	}
++	if code, body := api(t, "GET", "/api/operations/"+opID, nil); code != 410 ||
++		!strings.Contains(string(body), "recoverable") {
++		t.Fatalf("expired GET = %d %s", code, truncate(body, 200))
++	}
++	// Re-POST of an expired ID is also a definitive 410.
++	if code, body, _ := postWithOp(t, "POST", "/api/auto-snapshot/takeover", opID, nil); code != 410 {
++		t.Fatalf("expired replay = %d %s", code, truncate(body, 200))
++	}
++}
++
++func TestOperationStreamSnapshotAndResume(t *testing.T) {
++	opID := opUUID(t)
++	if status, _, _ := postWithOp(t, "POST", "/api/auto-snapshot/takeover", opID, nil); status != 200 {
++		t.Fatalf("seed status = %d", status)
++	}
++	_, rec := getOperation(t, opID)
++
++	// Fresh connect: snapshot full replace + id lines.
++	lastSeq := strconv.FormatInt(rec.SeqLast, 10)
++	lines := streamEvents(t, opID, "", 10*time.Second)
++	joined := strings.Join(lines, "\n")
++	if !strings.Contains(joined, "event: op.snapshot") ||
++		!strings.Contains(joined, "id: "+lastSeq) ||
++		!strings.Contains(joined, opID) {
++		t.Fatalf("snapshot stream missing pieces:\n%s", joined)
++	}
++
++	// Resume at the last confirmed seq: snapshot must not repeat; the
++	// terminal finished event alone is delivered.
++	lines2 := streamEvents(t, opID, lastSeq, 10*time.Second)
++	joined2 := strings.Join(lines2, "\n")
++	if strings.Contains(joined2, "op.snapshot") {
++		t.Fatalf("resume at latest seq re-sent snapshot:\n%s", joined2)
++	}
++	if !strings.Contains(joined2, "event: op.finished") {
++		t.Fatalf("resume missing finished:\n%s", joined2)
++	}
++}
++
++func TestOperationStreamsAreIsolated(t *testing.T) {
++	idA := opUUID(t)
++	idB := opUUID(t)
++	if s, _, _ := postWithOp(t, "POST", "/api/auto-snapshot/takeover", idA, nil); s != 200 {
++		t.Fatal(s)
++	}
++	if s, _, _ := postWithOp(t, "POST", "/api/auto-snapshot/release", idB, nil); s != 200 {
++		t.Fatal(s)
++	}
++	a := streamEvents(t, idA, "", 5*time.Second)
++	b := streamEvents(t, idB, "", 5*time.Second)
++	ja := strings.Join(a, "\n")
++	jb := strings.Join(b, "\n")
++	if !strings.Contains(ja, idA) || strings.Contains(ja, idB) {
++		t.Fatalf("stream A leaked another operation:\n%s", ja)
++	}
++	if !strings.Contains(jb, idB) || strings.Contains(jb, idA) {
++		t.Fatalf("stream B leaked another operation:\n%s", jb)
++	}
++	if !strings.Contains(jb, "auto_snapshot.release") ||
++		!strings.Contains(ja, "auto_snapshot.takeover") {
++		t.Fatalf("streams returned wrong records:\nA:%s\nB:%s", ja, jb)
++	}
++}
++
++func TestOperationSurvivesClientDisconnect(t *testing.T) {
++	opID := opUUID(t)
++	login(t)
++
++	// Fire the request through a context we cancel shortly after dispatch;
++	// the runners detach client cancellation, so the change must run to a
++	// queryable terminal state anyway.
++	ctx, cancel := context.WithCancel(context.Background())
++	req, err := http.NewRequestWithContext(ctx, "POST",
++		baseURL+"/api/auto-snapshot/takeover", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Header.Set("X-Operation-ID", opID)
++	go func() {
++		time.Sleep(150 * time.Millisecond)
++		cancel()
++	}()
++	resp, err := client.Do(req)
++	if err == nil {
++		resp.Body.Close() // response may have arrived or been interrupted
++	}
++
++	rec := waitForTerminal(t, opID)
++	if rec.Status != "succeeded" {
++		t.Fatalf("background completion status = %s (%s)", rec.Status, rec.Error)
++	}
++}
++
++func TestJobsLaneUnaffected(t *testing.T) {
++	// The jobs channel keeps answering; operation tracking does not wrap it.
++	status, b := api(t, "GET", "/api/jobs", nil)
++	if status != 200 {
++		t.Fatalf("jobs status = %d: %s", status, b)
++	}
++	// Cancelling a nonexistent job stays in the jobs lane (4xx, no contract
++	// on operation headers).
++	status, _ = api(t, "POST", "/api/jobs/does-not-exist/cancel", nil)
++	if status != 400 && status != 404 {
++		t.Fatalf("unexpected jobs cancel status = %d", status)
++	}
++}
+diff --git a/wiki/API-Reference.md b/wiki/API-Reference.md
+index 2ba0cbf..5596798 100644
+--- a/wiki/API-Reference.md
++++ b/wiki/API-Reference.md
+@@ -17,7 +17,9 @@ All endpoints are served at `http://<host>:8080`. The API is JSON-over-HTTP; all
+ | GET    | `/api/snapshots/diff`       | Files changed between snapshots (`zfs diff`) |
+ | GET    | `/api/iostat`               | Pool I/O statistics (1-second sample) |
+ | GET    | `/api/smart`                | S.M.A.R.T. health per disk |
+-| GET    | `/api/events`               | Server-Sent Events stream |
++| GET    | `/api/events`               | Server-Sent Events stream (cache topics + jobs.update) |
++| GET    | `/api/operations/{id}`       | Query an accepted change operation (status, steps, terminal error) |
++| GET    | `/api/operations/{id}/events` | Per-operation Server-Sent Events (resumable via Last-Event-ID) |
+ | GET    | `/metrics`                  | Prometheus text exposition |
+ | POST   | `/api/datasets`             | Create a dataset or volume |
+ | PATCH  | `/api/datasets/{name}`      | Update dataset properties |
+@@ -272,6 +274,103 @@ Removes a terminal job from the manager and deletes its on-disk record. Returns
+ 
+ ---
+ 
++## Operations (tracked change progress)
++
++Every state-changing request that passes validation is an **accepted change
++operation**: the Ansible playbook lane and the in-process ops lane append
++their task steps to the same operation, which ends in exactly one terminal
++state. Operations are identified by a stable ID, so progress is isolated per
++browser tab and a lost HTTP response never leaves the result unknown.
++
++The browser generates the ID and sends it on the request; the server echoes
++it back. Operations are in-memory and bounded (history is pruned after the
++operation finishes); the long-running data-plane lane (`/api/jobs`) is
++unchanged.
++
++### Request/response header
++
++| Header | Direction | Purpose |
++|--------|-----------|---------|
++| `X-Operation-ID: op_<UUID>` | request (all change POST/PUT/PATCH/DELETE except `/api/jobs*`, `/api/replication*`, `snapshots/send`, `rewrite/*`) | Client-generated canonical UUID idempotency key |
++| `X-Operation-ID` | response | Echoes the accepted ID (present on the first response, including replays) |
++
++The normal success/error response bodies are unchanged (`tasks` in the
++success body / `{error,tasks}` on failure). The operation ID travels only in
++the header so existing clients see the same content.
++
++### Idempotent replay
++
++Re-POSTing a request with the same `X-Operation-ID` never executes the change
++twice:
++
++| Existing state | Response |
++|----------------|----------|
++| Still running  | `409` `{"error":"operation already in progress","operation_id":"…","status":"running"}` |
++| Terminal       | `200` (succeeded) or `500` (failed/timeout) with the canonical body `{"operation_id","status","error","tasks"}` |
++| Evicted (expired) | `410` `{"error":"operation expired: its result is no longer available","recoverable":false,"operation_id":"…"}` |
++| Malformed ID   | `400` |
++
++### GET /api/operations/{id}
++
++Returns the full current record (a running operation is queryable too):
++
++```json
++{
++  "operation_id": "op_…",
++  "action": "dataset.modify",
++  "target": "tank/data",
++  "req_id": "f040e8d91d6c9c27",
++  "status": "succeeded",
++  "seq_first": 1,
++  "seq_last": 3,
++  "steps": [
++    {"seq": 1, "name": "assert", "status": "ok"},
++    {"seq": 2, "name": "set property", "status": "changed", "msg": ""}
++  ],
++  "error": "",
++  "started_at": "2026-10-15T06:15:44.313413Z",
++  "finished_at": "2026-10-15T06:15:44.911220Z"
++}
++```
++
++`status` is one of `running`, `succeeded`, `failed`, `timeout`. Steps carry
++gapless per-operation sequence numbers; only the most recent 500 steps are
++retained per operation (single `msg` capped at 16 KiB). Unknown IDs return
++`404`; IDs whose records have been pruned return `410`
++(`recoverable:false`) for a bounded tombstone window.
++
++### GET /api/operations/{id}/events
++
++A per-operation Server-Sent Events stream (separate from `/api/events`):
++
++- Resume position: browser-managed `Last-Event-ID` header or `?since=<n>`.
++- Every event carries an `id: <seq>` line.
++- Event types:
++  - `op.snapshot` — full record (full-replace semantics); sent on connect
++    when `since` is 0 or older than the retained step window; `id` is the
++    latest seq.
++  - `op.step` — one new step (`{seq,name,status,msg}`); sent only for seqs
++    newer than the resume position.
++  - `op.finished` — `{status,error}`; terminal.
++- A slow consumer whose buffer fills is dropped and the response ends; the
++  browser's EventSource reconnects automatically with `Last-Event-ID`, and
++  the server replays the missing range (or a snapshot if it aged out) —
++  gaps and duplicates are impossible under full-replace + seq dedup.
++- 30 s `: keepalive` heartbeats; unknown/expired IDs produce `404`/`410`
++  JSON before the SSE headers are written.
++
++### Bounds
++
++At most 500 steps are retained per operation (single `msg` ≤ 16 KiB); at most
++200 terminal operations are kept (and for at most 1 hour after finish);
++evicted IDs answer `410` for a bounded tombstone window (256 entries / 1
++hour), then `404`. The replay journal buffers 32 events per live SSE
++subscriber — a consumer that fills it is dropped (the response ends and the
++client reconnects via `Last-Event-ID`). Metrics:
++`dumpstore_operations_accepted_total`,
++`dumpstore_operations_finished_total{status="succeeded|failed|timeout"}`,
++`dumpstore_operations_running`.
++
+ ## Scheduled replication
+ 
+ Cron-scheduled replication tasks. Each fire creates a `dumpstore-repl-<UTC>` snapshot on the source, holds it for the duration of the transfer, picks the most recent common `dumpstore-repl-*` snapshot for an incremental send, dispatches the pipeline through the jobs runner, releases the hold, and prunes destination replication snapshots beyond the retention count.
+@@ -811,7 +910,16 @@ Subscribe to live data updates. The server pushes named events whenever data cha
+ | `iostat`         | Same JSON as `GET /api/iostat`    | Every 10 s                  |
+ | `user.query`     | Same JSON as `GET /api/users`     | Every 10 s on change + after writes |
+ | `group.query`    | Same JSON as `GET /api/groups`    | Every 10 s on change + after writes |
+-| `ansible.progress` | Single `TaskStep` object        | Streamed during playbook run |
++| `service.query`  | Same JSON as `GET /api/services`  | After service actions |
++| `jobs.update`    | Single `Job` object               | On job state change |
++| `replication.update` | Replication task snapshot     | On task change |
++| `autosnap.status` | Auto-snapshot takeover status    | After takeover/release |
++
++Change-progress steps are **not** on this connection: they stream on the
++per-operation channel `GET /api/operations/{id}/events` (see
++[Operations](#operations-tracked-change-progress)). The legacy
++`ansible.progress` topic is retained in the topic allow-list for backward
++compatibility but has no publishers.
+ 
+ ```
+ event: pool.query
+diff --git a/wiki/Architecture.md b/wiki/Architecture.md
+index 8300487..299b41b 100644
+--- a/wiki/Architecture.md
++++ b/wiki/Architecture.md
+@@ -142,29 +142,45 @@ Reads call ZFS/system CLI tools directly. Writes are split across three lanes by
+ | **Config-file / OS-resource writes** | `exec.Command(ansible-playbook)` + ndjson callback | smb.conf rendering, users/groups, TLS, ACLs, dataset property playbooks, scrub schedules, service control |
+ | **Long-running data-plane** | `internal/jobs` — background process groups | `zfs send \| recv`, `zfs rewrite` |
+ 
+-Both write lanes return the same `tasks: [...]` step shape (`ansible.TaskStep`) and stream live progress on the `ansible.progress` SSE topic — the frontend op-log cannot tell them apart. Input validation for ops-lane writes lives solely in the Go handlers. Ansible (and Python) remains a dependency only for the config-file / OS-resource features.
++Both synchronous write lanes return the same `tasks: [...]` step shape (`ansible.TaskStep`) and, once a request is accepted, record their steps on one **operation** (`internal/operations`) which owns a gapless sequence, a single terminal state and a bounded replay journal — the frontend op-log cannot tell the two lanes apart. Input validation for ops-lane writes lives solely in the Go handlers. Ansible (and Python) remains a dependency only for the config-file / OS-resource features. The long-running jobs lane is separate: it keeps its own persisted records and the `jobs.update` topic and is not wrapped in operations.
++
++### Accepted-change operations
++
++Every validated change is accepted into an `operations.Manager` before execution begins:
++
++- **Identity** — the browser sends a canonical `X-Operation-ID: op_<UUID>` (idempotency key); the server falls back to a 24-hex id. The accepted ID is echoed in the response header. Re-POSTing a known ID never executes twice (409 while running, canonical 200/500 terminal replay, 410 once history is pruned).
++- **Unified steps and terminal state** — both lanes append steps to the same operation (`running → succeeded | failed | timeout`; playbook/step timeouts wrap sentinel errors and classify as `timeout`). One request that runs several playbooks (e.g. TLS issue + config write, SMB init + apply) is one operation sharing one sequence.
++- **Resumable streams** — each operation has a `broker.Journal`: ordered, bounded, replayable (ring of events, non-blocking delivery, slow subscriber dropped exactly like the cache broker). `GET /api/operations/{id}/events` sends `id: <seq>` SSE events (`op.snapshot` full replace, `op.step`, `op.finished`); reconnects resume from `Last-Event-ID`/`?since=`, so a dropped connection — including a dropped slow subscriber — closes the gap without duplicates. `GET /api/operations/{id}` answers the deterministic result after a lost response; progress also survives client disconnect because both runners already detach the request context (`WithoutCancel`) and the operation is finalised when the response is first committed, even if that write fails.
++- **Bounded history** — ≤500 steps per operation (16 KiB/msg), ≤200 terminal operations and ≤1 h after finish, ≤256 tombstones; in-memory only (no orphan mutation exists after a process stop).
++- **Correlation** — accepted/finished log lines, per-step debug lines and the existing audit line all carry `op_id` alongside the middleware `req_id`.
++
++The cache-topic broker (`*.query`, `poolstatus`, `iostat`, `jobs.update`, …) on `/api/events` is unchanged; per-operation progress never touches it (the retired global `ansible.progress` topic has no publishers).
+ 
+ ## Write operation request flow
+ 
+ ```
+ Browser
+   │  POST /api/snapshots  {"dataset":"tank/data","snapname":"bkp"}
++  │  X-Operation-ID: op_<uuid> ; EventSource GET /api/operations/<id>/events
+   ▼
+ zfs_handlers.go: createSnapshot()
+   │  validate input (names, labels — Go is the single validation point)
++  │  beginOperation(): manager.Start(id, "snapshot.create", …) → header echo
+   │  build argv: ["zfs", "snapshot", "tank/data@bkp"]
+   ▼
+ internal/ops: Run(steps)          ← in-process, no shell, no Python
+   │  exec zfs snapshot tank/data@bkp
+-  │  step result → ansible.TaskStep{name, status, msg}
+-  │  each step → ansible.progress SSE topic (live op-log)
++  │  step result → operation.AddStep (seq, ring) → broker.Journal publish
+   ▼
++response committed → operation finalised (succeeded/failed/timeout)
+ handlers.go: return 201 {"snapshot":"tank/data@bkp","tasks":[...]}
+-  ▼
+-Browser: showOpLog() renders task steps in modal
++  ▼                                      ▲
++Browser: showOpLog() renders tasks       └ op.snapshot/op.step live (per-tab
++                                                  isolated, resumable)
+ 
+ Config-file writes (e.g. SMB shares, user creation) take the same shape
+-but execute via ansible-playbook with the ndjson callback.
++but execute via ansible-playbook with the ndjson callback; multiple
++playbooks in one request append to the same operation sequence.
+ ```
+ 
+ ## Frontend

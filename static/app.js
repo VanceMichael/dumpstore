@@ -233,10 +233,11 @@ async function tlsAcmeRenew() {
 // If SSE is unavailable, startPolling() is called from the onerror handler.
 //
 // Safety-net: re-fetch all REST state every 60 s regardless of SSE health.
-// SSE events can be silently dropped when the subscriber channel is full
-// (broker logs "subscriber slow, dropping message"). When that happens the
-// poller will not re-publish if the underlying data has not changed, leaving
-// the browser permanently stale. This interval guarantees recovery.
+// A cache topic event can be silently dropped when the subscriber channel is
+// full (broker logs "subscriber slow, closing connection"); the poller then
+// will not re-publish if the underlying data has not changed, leaving the
+// browser stale. Operation progress is unaffected — its per-operation stream
+// replays gaps on reconnect — but this interval guarantees cache recovery.
 setInterval(loadAll, 60_000);
 initAuthHeader();
 initAuthConfig();

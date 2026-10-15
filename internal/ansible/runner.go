@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,17 @@ import (
 // tracer resolves through the global provider — a no-op unless the OTEL SDK
 // is installed at startup.
 var tracer = otel.Tracer("dumpstore")
+
+// ErrTimedOut wraps the error returned when a playbook does not finish within
+// the runner's per-playbook timeout. Callers classify the operation terminal
+// state with errors.Is(err, ErrTimedOut).
+var ErrTimedOut = errors.New("ansible playbook timed out")
+
+// timeoutError builds the wrapped sentinel error for a deadline-exceeded run,
+// keeping the playbook name and the configured limit in the message.
+func timeoutError(playbook string, d time.Duration) error {
+	return fmt.Errorf("%w: playbook %s after %s", ErrTimedOut, playbook, d)
+}
 
 // TaskResult holds the raw result fields from a single Ansible task (used by RunAndGetStdout).
 type TaskResult struct {
@@ -59,6 +71,12 @@ type PlaybookOutput struct {
 // Steps returns the ordered list of task steps.
 func (o *PlaybookOutput) Steps() []TaskStep {
 	return o.steps
+}
+
+// NewPlaybookOutput builds a result from steps. It exists so non-runner code
+// (tests, fakes) can construct a result value.
+func NewPlaybookOutput(steps []TaskStep) *PlaybookOutput {
+	return &PlaybookOutput{steps: steps}
 }
 
 // Runner executes Ansible playbooks.
@@ -183,7 +201,7 @@ func (r *Runner) runCore(ctx context.Context, playbook string, extraVars map[str
 	if ctx.Err() == context.DeadlineExceeded {
 		slog.Error("ansible-playbook timed out", "playbook", playbook, "timeout", r.Timeout)
 		r.metrics.record(playbookLabel, elapsed, true)
-		return nil, fmt.Errorf("ansible-playbook %s: timed out after %s", playbook, r.Timeout)
+		return nil, timeoutError(playbook, r.Timeout)
 	}
 
 	out = &PlaybookOutput{steps: steps}

@@ -1,5 +1,5 @@
 import { state, storeSet, storeBatch } from './store.js';
-import { api, esc, toast, setRefreshing, appendOpLogStep, opLogDialog } from './utils.js';
+import { api, esc, toast, setRefreshing } from './utils.js';
 import { refreshACLStatus } from './dataset-dialogs.js';
 import { mergeJob } from './jobs.js';
 
@@ -174,7 +174,10 @@ function stopPolling() {
 
 export function startSSE() {
   if (_es) { _es.close(); _es = null; }
-  const topics = [...Object.keys(sseTopicMap), 'ansible.progress', 'jobs.update'].join(',');
+  // Per-change operation progress is delivered on operation-specific
+  // EventSource streams managed in utils.js (isolation + replay), not on
+  // this shared cache-topic connection.
+  const topics = [...Object.keys(sseTopicMap), 'jobs.update'].join(',');
   const es = new EventSource('/api/events?topics=' + encodeURIComponent(topics));
   _es = es;
 
@@ -187,16 +190,6 @@ export function startSSE() {
     // server restarts and post-reboot reconnects.
     loadAll();
   };
-
-  es.addEventListener('ansible.progress', e => {
-    try {
-      const step = JSON.parse(e.data);
-      // Only append if the dialog is open and still in running state (close button disabled)
-      if (opLogDialog.open && document.getElementById('opLogClose').disabled) {
-        appendOpLogStep(step);
-      }
-    } catch (err) { console.warn('[SSE] ansible.progress parse error', err); }
-  });
 
   // jobs.update publishes a single Job per event; merge into state.jobs by id.
   es.addEventListener('jobs.update', e => {

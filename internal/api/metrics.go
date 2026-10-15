@@ -94,6 +94,7 @@ func (h *Handler) getMetrics(w http.ResponseWriter, _ *http.Request) {
 	globalHTTP.emitTo(w)
 	h.runner.EmitMetrics(w)
 	h.ops.EmitMetrics(w)
+	h.opMgr.EmitMetrics(w)
 }
 
 func gauge(w http.ResponseWriter, name, help string, val float64) {

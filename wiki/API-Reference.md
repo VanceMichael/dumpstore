@@ -17,7 +17,9 @@ All endpoints are served at `http://<host>:8080`. The API is JSON-over-HTTP; all
 | GET    | `/api/snapshots/diff`       | Files changed between snapshots (`zfs diff`) |
 | GET    | `/api/iostat`               | Pool I/O statistics (1-second sample) |
 | GET    | `/api/smart`                | S.M.A.R.T. health per disk |
-| GET    | `/api/events`               | Server-Sent Events stream |
+| GET    | `/api/events`               | Server-Sent Events stream (cache topics + jobs.update) |
+| GET    | `/api/operations/{id}`       | Query an accepted change operation (status, steps, terminal error) |
+| GET    | `/api/operations/{id}/events` | Per-operation Server-Sent Events (resumable via Last-Event-ID) |
 | GET    | `/metrics`                  | Prometheus text exposition |
 | POST   | `/api/datasets`             | Create a dataset or volume |
 | PATCH  | `/api/datasets/{name}`      | Update dataset properties |
@@ -271,6 +273,103 @@ Sends SIGTERM to the job's process group, escalating to SIGKILL after a 10 s gra
 Removes a terminal job from the manager and deletes its on-disk record. Returns `204 No Content` on success, `400` if the job is still running (cancel it first).
 
 ---
+
+## Operations (tracked change progress)
+
+Every state-changing request that passes validation is an **accepted change
+operation**: the Ansible playbook lane and the in-process ops lane append
+their task steps to the same operation, which ends in exactly one terminal
+state. Operations are identified by a stable ID, so progress is isolated per
+browser tab and a lost HTTP response never leaves the result unknown.
+
+The browser generates the ID and sends it on the request; the server echoes
+it back. Operations are in-memory and bounded (history is pruned after the
+operation finishes); the long-running data-plane lane (`/api/jobs`) is
+unchanged.
+
+### Request/response header
+
+| Header | Direction | Purpose |
+|--------|-----------|---------|
+| `X-Operation-ID: op_<UUID>` | request (all change POST/PUT/PATCH/DELETE except `/api/jobs*`, `/api/replication*`, `snapshots/send`, `rewrite/*`) | Client-generated canonical UUID idempotency key |
+| `X-Operation-ID` | response | Echoes the accepted ID (present on the first response, including replays) |
+
+The normal success/error response bodies are unchanged (`tasks` in the
+success body / `{error,tasks}` on failure). The operation ID travels only in
+the header so existing clients see the same content.
+
+### Idempotent replay
+
+Re-POSTing a request with the same `X-Operation-ID` never executes the change
+twice:
+
+| Existing state | Response |
+|----------------|----------|
+| Still running  | `409` `{"error":"operation already in progress","operation_id":"…","status":"running"}` |
+| Terminal       | `200` (succeeded) or `500` (failed/timeout) with the canonical body `{"operation_id","status","error","tasks"}` |
+| Evicted (expired) | `410` `{"error":"operation expired: its result is no longer available","recoverable":false,"operation_id":"…"}` |
+| Malformed ID   | `400` |
+
+### GET /api/operations/{id}
+
+Returns the full current record (a running operation is queryable too):
+
+```json
+{
+  "operation_id": "op_…",
+  "action": "dataset.modify",
+  "target": "tank/data",
+  "req_id": "f040e8d91d6c9c27",
+  "status": "succeeded",
+  "seq_first": 1,
+  "seq_last": 3,
+  "steps": [
+    {"seq": 1, "name": "assert", "status": "ok"},
+    {"seq": 2, "name": "set property", "status": "changed", "msg": ""}
+  ],
+  "error": "",
+  "started_at": "2026-10-15T06:15:44.313413Z",
+  "finished_at": "2026-10-15T06:15:44.911220Z"
+}
+```
+
+`status` is one of `running`, `succeeded`, `failed`, `timeout`. Steps carry
+gapless per-operation sequence numbers; only the most recent 500 steps are
+retained per operation (single `msg` capped at 16 KiB). Unknown IDs return
+`404`; IDs whose records have been pruned return `410`
+(`recoverable:false`) for a bounded tombstone window.
+
+### GET /api/operations/{id}/events
+
+A per-operation Server-Sent Events stream (separate from `/api/events`):
+
+- Resume position: browser-managed `Last-Event-ID` header or `?since=<n>`.
+- Every event carries an `id: <seq>` line.
+- Event types:
+  - `op.snapshot` — full record (full-replace semantics); sent on connect
+    when `since` is 0 or older than the retained step window; `id` is the
+    latest seq.
+  - `op.step` — one new step (`{seq,name,status,msg}`); sent only for seqs
+    newer than the resume position.
+  - `op.finished` — `{status,error}`; terminal.
+- A slow consumer whose buffer fills is dropped and the response ends; the
+  browser's EventSource reconnects automatically with `Last-Event-ID`, and
+  the server replays the missing range (or a snapshot if it aged out) —
+  gaps and duplicates are impossible under full-replace + seq dedup.
+- 30 s `: keepalive` heartbeats; unknown/expired IDs produce `404`/`410`
+  JSON before the SSE headers are written.
+
+### Bounds
+
+At most 500 steps are retained per operation (single `msg` ≤ 16 KiB); at most
+200 terminal operations are kept (and for at most 1 hour after finish);
+evicted IDs answer `410` for a bounded tombstone window (256 entries / 1
+hour), then `404`. The replay journal buffers 32 events per live SSE
+subscriber — a consumer that fills it is dropped (the response ends and the
+client reconnects via `Last-Event-ID`). Metrics:
+`dumpstore_operations_accepted_total`,
+`dumpstore_operations_finished_total{status="succeeded|failed|timeout"}`,
+`dumpstore_operations_running`.
 
 ## Scheduled replication
 
@@ -811,7 +910,16 @@ Subscribe to live data updates. The server pushes named events whenever data cha
 | `iostat`         | Same JSON as `GET /api/iostat`    | Every 10 s                  |
 | `user.query`     | Same JSON as `GET /api/users`     | Every 10 s on change + after writes |
 | `group.query`    | Same JSON as `GET /api/groups`    | Every 10 s on change + after writes |
-| `ansible.progress` | Single `TaskStep` object        | Streamed during playbook run |
+| `service.query`  | Same JSON as `GET /api/services`  | After service actions |
+| `jobs.update`    | Single `Job` object               | On job state change |
+| `replication.update` | Replication task snapshot     | On task change |
+| `autosnap.status` | Auto-snapshot takeover status    | After takeover/release |
+
+Change-progress steps are **not** on this connection: they stream on the
+per-operation channel `GET /api/operations/{id}/events` (see
+[Operations](#operations-tracked-change-progress)). The legacy
+`ansible.progress` topic is retained in the topic allow-list for backward
+compatibility but has no publishers.
 
 ```
 event: pool.query

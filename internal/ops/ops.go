@@ -3,9 +3,10 @@
 // It replaces Ansible for mutations that are just "assert inputs, run one
 // argv command" (zpool scrub/replace/add/…, zfs snapshot/destroy/set) —
 // see issue #115. Input validation lives in the API handlers; commands run
-// argv-style with no shell. Step results use the exact ansible.TaskStep
-// shape so the frontend op-log dialog and the ansible.progress SSE topic
-// work unchanged.
+// argv-style with no shell. Step results use the ansible.TaskStep shape and
+// are appended to the request's tracked internal/operations record (gapless
+// sequence, single terminal state, per-operation resumable SSE), so the
+// frontend op-log dialog renders this lane and the Ansible lane identically.
 //
 // Ansible remains the write path for config-file ownership (smb.conf),
 // service state, and OS resources (users/groups); long-running data-plane
@@ -14,6 +15,7 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -30,6 +32,11 @@ import (
 // tracer resolves through the global provider — a no-op unless the OTEL SDK
 // is installed at startup.
 var tracer = otel.Tracer("dumpstore")
+
+// ErrTimedOut wraps the error returned when a step's command does not finish
+// within the runner's per-step timeout. Callers classify the operation
+// terminal state with errors.Is(err, ErrTimedOut).
+var ErrTimedOut = errors.New("ops step timed out")
 
 // allowedBinaries is the closed set of binaries the ops layer may execute.
 // Handlers build steps from hardcoded argv literals; this check makes
@@ -57,6 +64,10 @@ type Result struct {
 // Steps returns the ordered step results.
 func (r *Result) Steps() []ansible.TaskStep { return r.steps }
 
+// NewResult builds a result from steps. It exists so non-runner code (tests,
+// fakes) can construct a result value.
+func NewResult(steps []ansible.TaskStep) *Result { return &Result{steps: steps} }
+
 // Runner executes Steps sequentially with a per-step timeout.
 type Runner struct {
 	Timeout time.Duration
@@ -76,6 +87,7 @@ func NewRunner() *Runner {
 func (r *Runner) Run(ctx context.Context, steps []Step, onStep func(ansible.TaskStep)) (*Result, error) {
 	res := &Result{}
 	var failed []string
+	var failedErrs []error
 	for _, st := range steps {
 		ts, err := r.runStep(ctx, st)
 		res.steps = append(res.steps, ts)
@@ -84,14 +96,17 @@ func (r *Runner) Run(ctx context.Context, steps []Step, onStep func(ansible.Task
 		}
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s (%s)", st.Name, ts.Msg))
+			failedErrs = append(failedErrs, err)
 			if !st.ContinueOnError {
 				break
 			}
 		}
 	}
 	if len(failed) > 0 {
-		return res, fmt.Errorf("%d of %d step(s) failed: %s",
-			len(failed), len(res.steps), strings.Join(failed, "; "))
+		// Wrap the underlying step errors (joined) in addition to the human
+		// summary so errors.Is(err, ErrTimedOut) still reaches the cause.
+		return res, fmt.Errorf("%d of %d step(s) failed: %s: %w",
+			len(failed), len(res.steps), strings.Join(failed, "; "), errors.Join(failedErrs...))
 	}
 	return res, nil
 }
@@ -118,6 +133,21 @@ func (r *Runner) runStep(ctx context.Context, st Step) (ansible.TaskStep, error)
 	start := time.Now()
 	out, err := exec.CommandContext(ctx, st.Argv[0], st.Argv[1:]...).CombinedOutput()
 	r.metrics.record(opLabel(st.Argv), time.Since(start), err != nil)
+
+	// Timeout takes precedence over the generic exit error so callers can
+	// classify the operation terminal state via errors.Is(err, ErrTimedOut).
+	if ctx.Err() == context.DeadlineExceeded {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = fmt.Sprintf("timed out after %s", r.Timeout)
+		}
+		ts := ansible.TaskStep{Name: st.Name, Status: "failed", Msg: msg}
+		stepErr := fmt.Errorf("%w: %s: step %q after %s",
+			ErrTimedOut, strings.Join(st.Argv, " "), st.Name, r.Timeout)
+		span.RecordError(stepErr)
+		span.SetStatus(codes.Error, msg)
+		return ts, stepErr
+	}
 
 	msg := strings.TrimSpace(string(out))
 	ts := ansible.TaskStep{Name: st.Name, Status: "changed", Msg: msg}

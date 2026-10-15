@@ -24,6 +24,7 @@ import (
 	"dumpstore/internal/broker"
 	"dumpstore/internal/jobs"
 	"dumpstore/internal/logging"
+	"dumpstore/internal/operations"
 	otelx "dumpstore/internal/otel"
 	"dumpstore/internal/platform"
 	"dumpstore/internal/replication"
@@ -144,6 +145,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	opMgr := operations.NewManager(operations.DefaultConfig())
+
 	sched := scheduler.New()
 	replStore, err := replication.NewStore(platform.StateDir(runtime.GOOS))
 	if err != nil {
@@ -174,7 +177,7 @@ func main() {
 	sched.Start(ctx)
 	defer sched.Stop()
 
-	apiHandler := api.NewHandler(runner, version, b, jobMgr, replRunner, autosnapRunner, cfg, store, *configPath)
+	apiHandler := api.NewHandler(runner, version, b, jobMgr, replRunner, autosnapRunner, cfg, store, *configPath, opMgr)
 	apiHandler.SetOtelInfo(otelx.Status())
 
 	mux := http.NewServeMux()

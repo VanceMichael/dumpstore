@@ -2,8 +2,10 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"dumpstore/internal/ansible"
 )
@@ -111,5 +113,41 @@ func TestRunRejectsUnlistedBinary(t *testing.T) {
 	if len(steps) != 1 || steps[0].Status != "failed" ||
 		!strings.Contains(steps[0].Msg, "allowlist") {
 		t.Errorf("unlisted binary step: %+v", steps)
+	}
+}
+
+func TestRunTimeoutWrapsSentinel(t *testing.T) {
+	allowForTest(t, "sleep")
+	r := NewRunner()
+	r.Timeout = 20 * time.Millisecond
+	res, err := r.Run(context.Background(), []Step{
+		{Name: "slow command", Argv: []string{"sleep", "2"}},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !errors.Is(err, ErrTimedOut) {
+		t.Fatalf("errors.Is(err, ErrTimedOut) = false; err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "20ms") {
+		t.Fatalf("error should carry the timeout duration: %v", err)
+	}
+	steps := res.Steps()
+	if len(steps) != 1 || steps[0].Status != "failed" {
+		t.Fatalf("timeout step: %+v", steps)
+	}
+}
+
+func TestRunOrdinaryFailureIsNotTimeout(t *testing.T) {
+	allowForTest(t, "false")
+	r := NewRunner()
+	_, err := r.Run(context.Background(), []Step{
+		{Name: "fail", Argv: []string{"false"}},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, ErrTimedOut) {
+		t.Fatalf("plain failure must not classify as timeout: %v", err)
 	}
 }

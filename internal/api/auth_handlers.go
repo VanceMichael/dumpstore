@@ -39,6 +39,16 @@ func (h *Handler) changePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(r.Context(), w, http.StatusInternalServerError, errors.New("failed to hash password"), nil)
 		return
 	}
+	// The target username is already known from the current config; read it
+	// under the same lock used later so the operation target matches the
+	// audit line.
+	h.authMu.RLock()
+	existingUsername := h.authCfg.Username
+	h.authMu.RUnlock()
+	w, r, replayed := h.beginOperation(w, r, "auth.change_password", existingUsername)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "auth_set_password.yml", map[string]string{
 		"config_path":   h.configPath,
 		"password_hash": string(hash),
@@ -67,6 +77,10 @@ func (h *Handler) changeUsername(w http.ResponseWriter, r *http.Request) {
 	}
 	if !reUsername.MatchString(req.Username) {
 		writeError(r.Context(), w, http.StatusBadRequest, errors.New("invalid username: use letters, digits, underscores, hyphens, dots; must start with a letter"), nil)
+		return
+	}
+	w, r, replayed := h.beginOperation(w, r, "auth.change_username", req.Username)
+	if replayed {
 		return
 	}
 	out, err := h.runOp(r.Context(), "auth_set_username.yml", map[string]string{

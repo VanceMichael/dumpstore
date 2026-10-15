@@ -39,7 +39,7 @@ Sub-features for managed services (shares, home dirs, Time Machine targets) are 
 3. **Config-file / OS-resource writes**: `ansible-playbook` with ndjson callback (config-rendering services: SMB users, TLS certs, ACLs, dataset property playbooks). Python dependency required only for this lane.
 4. **Long-running data-plane** (`internal/jobs`): background process groups via `exec.Command` — `zfs send \| recv`, `zfs rewrite` (hours-long, 202 + polling).
 
-Both write lanes report the same `tasks: [...]` step shape and stream live progress over the `ansible.progress` SSE topic.
+Both write lanes report the same `tasks: [...]` step shape. Every accepted change in these two lanes is wrapped by an `internal/operations` operation: stable client-generated ID (`X-Operation-ID`), one gapless step sequence, one terminal state (`succeeded`/`failed`/`timeout`), and per-operation resumable SSE (`GET /api/operations/{id}/events`) with bounded history. Do not publish operation progress on the cache-topic broker — the retired global `ansible.progress` topic has no publishers. The jobs lane is separate and keeps its own records/topic.
 
 ## Build & install
 

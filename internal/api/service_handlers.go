@@ -55,6 +55,10 @@ func (h *Handler) mutateService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "service."+action, svc)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), servicePlaybook(), map[string]string{
 		"service_name": unitName,
 		"action":       action,

@@ -644,6 +644,13 @@
       </div>
       <div class="pool-card">
         <div class="pool-card-header">
+          <span class="pool-name">Tracked, recoverable operations</span>
+          <span class="health-badge badge-blue">op_&lt;uuid&gt;</span>
+        </div>
+        <p>Every accepted change gets a stable operation ID with ordered steps and one deterministic result (<code>succeeded</code>/<code>failed</code>/<code>timeout</code>). Progress streams on a per-tab, resumable SSE channel (<code>Last-Event-ID</code> replay) — tabs never mix steps, a dropped connection fills the gap without duplicates, and a lost response is resolved by ID after reconnect instead of showing “unknown”. Expired operations answer <code>410</code>.</p>
+      </div>
+      <div class="pool-card">
+        <div class="pool-card-header">
           <span class="pool-name">TLS / HTTPS</span>
           <span class="health-badge badge-blue">--tls</span>
         </div>

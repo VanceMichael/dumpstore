@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"dumpstore/internal/autosnap"
 	"dumpstore/internal/broker"
 	"dumpstore/internal/jobs"
+	"dumpstore/internal/operations"
 	"dumpstore/internal/ops"
 	"dumpstore/internal/replication"
 	"dumpstore/internal/schema"
@@ -194,6 +196,7 @@ type Handler struct {
 	version    string
 	broker     *broker.Broker
 	jobs       *jobs.Manager
+	opMgr      *operations.Manager
 	repl       *replication.Runner
 	autosnap   *autosnap.Runner
 	userMu     sync.Mutex   // serialises user/group write ops to avoid /etc/group lock contention
@@ -203,22 +206,31 @@ type Handler struct {
 	authStore  *auth.SessionStore
 	configPath string
 	otelInfo   any // effective OTEL status for sysinfo; injected via SetOtelInfo
+
+	// Execution seams; production wiring points at the real runners. Tests
+	// replace them to drive the operation lifecycle without ansible/zfs.
+	execPlaybook func(ctx context.Context, playbook string, vars map[string]string, onStep func(ansible.TaskStep)) (*ansible.PlaybookOutput, error)
+	execLocal    func(ctx context.Context, steps []ops.Step, onStep func(ansible.TaskStep)) (*ops.Result, error)
 }
 
 // NewHandler creates a Handler with the given dependencies.
-func NewHandler(runner *ansible.Runner, version string, b *broker.Broker, jm *jobs.Manager, repl *replication.Runner, autosnap *autosnap.Runner, authCfg *auth.Config, authStore *auth.SessionStore, configPath string) *Handler {
-	return &Handler{
+func NewHandler(runner *ansible.Runner, version string, b *broker.Broker, jm *jobs.Manager, repl *replication.Runner, autosnap *autosnap.Runner, authCfg *auth.Config, authStore *auth.SessionStore, configPath string, opMgr *operations.Manager) *Handler {
+	h := &Handler{
 		runner:     runner,
 		ops:        ops.NewRunner(),
 		version:    version,
 		broker:     b,
 		jobs:       jm,
+		opMgr:      opMgr,
 		repl:       repl,
 		autosnap:   autosnap,
 		authCfg:    authCfg,
 		authStore:  authStore,
 		configPath: configPath,
 	}
+	h.execPlaybook = h.runner.RunStreaming
+	h.execLocal = h.ops.Run
+	return h
 }
 
 // AuthCfgRead calls fn while holding the authCfg read lock.
@@ -236,33 +248,74 @@ func (h *Handler) AuthCfgWrite(fn func(*auth.Config)) {
 }
 
 // auditLog emits a structured audit log line for every mutating API operation.
-// req_id is injected automatically by the journalHandler middleware.
-// Since the service has no authentication, operator identity is the client IP.
+// req_id is injected automatically by the journalHandler middleware and
+// op_id by beginOperation (when the request was accepted as a tracked
+// change). Since the service has no authentication, operator identity is the
+// client IP.
 func auditLog(ctx context.Context, r *http.Request, action, target string, err error) {
 	args := []any{"remote_ip", r.RemoteAddr, "action", action, "target", target, "outcome", "ok"}
 	if err != nil {
 		args[7] = "err"
 		args = append(args, "error", err.Error())
 	}
+	if op := operations.FromContext(ctx); op != nil {
+		args = append(args, "op_id", op.ID())
+	}
 	slog.InfoContext(ctx, "audit", args...)
 }
 
-// runOp executes a playbook and publishes each task step to the ansible.progress
-// SSE topic as it completes, so the frontend can show live progress. ctx is
-// used for trace-span parenting only; the runner drops its cancellation.
+// markOutcome records an execution lane's result on the operation in ctx.
+// Timeouts take precedence over ordinary failures. No-op without an op.
+func markOutcome(ctx context.Context, err error) {
+	op := operations.FromContext(ctx)
+	if op == nil || err == nil {
+		return
+	}
+	switch {
+	case errors.Is(err, ansible.ErrTimedOut) || errors.Is(err, ops.ErrTimedOut):
+		op.MarkTimeout(err.Error())
+	default:
+		op.MarkFailure(err.Error())
+	}
+}
+
+// runOp executes a playbook. When the request began a tracked operation
+// (beginOperation), each task step is appended to that operation with a
+// gapless sequence and published on the operation's replay stream instead
+// of the legacy global ansible.progress topic — that is what keeps one
+// browser tab's progress out of another tab's dialog. ctx is used for
+// trace-span parenting only; the runner drops its cancellation.
 func (h *Handler) runOp(ctx context.Context, playbook string, vars map[string]string) (*ansible.PlaybookOutput, error) {
-	return h.runner.RunStreaming(ctx, playbook, vars, func(step ansible.TaskStep) {
-		h.broker.PublishNoCache("ansible.progress", step)
+	op := operations.FromContext(ctx)
+	if op == nil {
+		// Defensive fallback: callers must begin an operation before the
+		// first execution. Retain the legacy topic for any un-migrated path.
+		return h.execPlaybook(ctx, playbook, vars, func(step ansible.TaskStep) {
+			h.broker.PublishNoCache("ansible.progress", step)
+		})
+	}
+	out, err := h.execPlaybook(ctx, playbook, vars, func(step ansible.TaskStep) {
+		h.opMgr.AddStep(op, step)
 	})
+	markOutcome(ctx, err)
+	return out, err
 }
 
 // runLocal executes argv steps through the in-process ops layer (#115),
-// publishing each step to the same ansible.progress SSE topic so the
-// frontend's live op-log works identically to playbook-backed writes.
+// recording them on the tracked operation exactly like playbook-backed
+// writes so the two lanes share one step stream and one terminal state.
 func (h *Handler) runLocal(ctx context.Context, steps ...ops.Step) (*ops.Result, error) {
-	return h.ops.Run(ctx, steps, func(step ansible.TaskStep) {
-		h.broker.PublishNoCache("ansible.progress", step)
+	op := operations.FromContext(ctx)
+	if op == nil {
+		return h.execLocal(ctx, steps, func(step ansible.TaskStep) {
+			h.broker.PublishNoCache("ansible.progress", step)
+		})
+	}
+	res, err := h.execLocal(ctx, steps, func(step ansible.TaskStep) {
+		h.opMgr.AddStep(op, step)
 	})
+	markOutcome(ctx, err)
+	return res, err
 }
 
 // RegisterRoutes attaches all API routes to mux.
@@ -302,6 +355,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/jobs/{id}", h.getJob)
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", h.cancelJob)
 	mux.HandleFunc("DELETE /api/jobs/{id}", h.removeJob)
+	mux.HandleFunc("GET /api/operations/{id}", h.getOperation)
+	mux.HandleFunc("GET /api/operations/{id}/events", h.getOperationEvents)
 	mux.HandleFunc("POST /api/snapshots/delete-batch", h.deleteSnapshotBatch)
 	mux.HandleFunc("DELETE /api/snapshots/{snapshot...}", h.deleteSnapshot)
 	mux.HandleFunc("GET /api/events", h.getEvents)

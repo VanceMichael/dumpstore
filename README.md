@@ -220,7 +220,7 @@ Sub-features (shares, home dirs, Time Machine targets) are gated behind an **ini
 | **Config-file / OS-resource writes** | `exec.Command(ansible-playbook)` | smb.conf rendering, users/groups, TLS, ACLs, dataset property playbooks — where idempotent orchestration earns its keep |
 | **Long-running data-plane** | `internal/jobs` — background process groups | `zfs send \| recv`, `zfs rewrite` — hours-long, 202 + job polling |
 
-Both write lanes report the same `tasks: [...]` step shape and stream live progress over the `ansible.progress` SSE topic, so the op-log dialog in the UI is identical regardless of lane. Ansible (and its Python dependency) is required only for the config-file / OS-resource features.
+Both write lanes report the same `tasks: [...]` step shape and append their steps to one accepted-change **operation** (`internal/operations`): a stable, client-generated operation ID, gapless step sequence and a single terminal state (`succeeded`/`failed`/`timeout`), streamed on a per-tab resumable SSE channel (`/api/operations/{id}/events`, replayable via `Last-Event-ID`) so the op-log dialog is identical regardless of lane, tabs never mix progress, and a lost response is resolved by ID instead of showing an "unknown" result. Ansible (and its Python dependency) is required only for the config-file / OS-resource features.
 
 ### Request flow for a write operation
 
@@ -235,7 +235,7 @@ zfs_handlers.go: createSnapshot()
 internal/ops: Run(steps)          ← in-process, no shell, no Python
   │  exec zfs snapshot tank/data@bkp
   │  step result → ansible.TaskStep{name, status, msg}
-  │  each step → ansible.progress SSE topic (live op-log)
+  │  each step → operation.AddStep (seq) → per-operation SSE (live op-log)
   ▼
 handlers.go: return 201 {"snapshot":"tank/data@bkp","tasks":[...]}
   ▼

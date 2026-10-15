@@ -84,6 +84,10 @@ func (h *Handler) tlsGenCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "tls.gencert", req.Hostname)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "tls_gencert.yml", map[string]string{
 		"hostname": req.Hostname,
 		"cert_dir": req.CertDir,
@@ -149,6 +153,10 @@ func (h *Handler) tlsSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "tls.set_config", req.CertPath)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "tls_set_config.yml", map[string]string{
 		"config_path": h.configPath,
 		"cert_path":   req.CertPath,
@@ -201,6 +209,10 @@ func (h *Handler) tlsAcmeIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "tls.acme_issue", req.Domain)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "tls_acme_issue.yml", map[string]string{
 		"email":    req.Email,
 		"domain":   req.Domain,
@@ -271,6 +283,10 @@ func (h *Handler) tlsAcmeRenew(w http.ResponseWriter, r *http.Request) {
 		certDir = certDirFromCertPath(certPath, h.configPath)
 	}
 
+	w, r, replayed := h.beginOperation(w, r, "tls.acme_renew", acmeDomain)
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "tls_acme_renew.yml", map[string]string{
 		"email":    acmeEmail,
 		"domain":   acmeDomain,

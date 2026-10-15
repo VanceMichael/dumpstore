@@ -35,6 +35,10 @@ func (h *Handler) takeoverAutoSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(r.Context(), w, http.StatusInternalServerError, fmt.Errorf("autosnap runner not initialised"), nil)
 		return
 	}
+	w, r, replayed := h.beginOperation(w, r, "auto_snapshot.takeover", "")
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "auto_snapshot_takeover.yml", map[string]string{})
 	auditLog(r.Context(), r, "auto_snapshot.takeover", "", err)
 	if err != nil {
@@ -56,6 +60,10 @@ func (h *Handler) releaseAutoSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.autosnap.Unregister()
+	w, r, replayed := h.beginOperation(w, r, "auto_snapshot.release", "")
+	if replayed {
+		return
+	}
 	out, err := h.runOp(r.Context(), "auto_snapshot_release.yml", map[string]string{})
 	auditLog(r.Context(), r, "auto_snapshot.release", "", err)
 	if err != nil {

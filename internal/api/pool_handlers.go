@@ -98,6 +98,10 @@ func (h *Handler) createPool(w http.ResponseWriter, r *http.Request) {
 		argv = append(argv, req.VdevType)
 	}
 	argv = append(argv, req.Devices...)
+	w, r, replayed := h.beginOperation(w, r, "pool.create", req.Name+" "+req.VdevType+" ["+strings.Join(req.Devices, " ")+"]")
+	if replayed {
+		return
+	}
 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Create pool " + req.Name, Argv: argv})
 	auditLog(r.Context(), r, "pool.create", req.Name+" "+req.VdevType+" ["+strings.Join(req.Devices, " ")+"]", err)
 	if err != nil {
@@ -214,6 +218,10 @@ func (h *Handler) addPoolDevices(w http.ResponseWriter, r *http.Request, pool, k
 		argv = append(argv, kind)
 	}
 	argv = append(argv, devices...)
+	w, r, replayed := h.beginOperation(w, r, "pool.add_"+kind, pool+" ["+strings.Join(devices, " ")+"]")
+	if replayed {
+		return
+	}
 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Add " + kind + " devices to " + pool, Argv: argv})
 	auditLog(r.Context(), r, "pool.add_"+kind, pool+" ["+strings.Join(devices, " ")+"]", err)
 	if err != nil {
@@ -236,6 +244,10 @@ func (h *Handler) removePoolDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validVdevName(device) {
 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid device identifier"), nil)
+		return
+	}
+	w, r, replayed := h.beginOperation(w, r, "pool.remove_device", pool+" "+device)
+	if replayed {
 		return
 	}
 	out, err := h.runLocal(r.Context(), ops.Step{
@@ -281,6 +293,10 @@ func (h *Handler) importPool(w http.ResponseWriter, r *http.Request) {
 		argv = append(argv, "-f")
 	}
 	argv = append(argv, req.Pool)
+	w, r, replayed := h.beginOperation(w, r, "pool.import", req.Pool)
+	if replayed {
+		return
+	}
 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Import pool " + req.Pool, Argv: argv})
 	auditLog(r.Context(), r, "pool.import", req.Pool, err)
 	if err != nil {
@@ -298,6 +314,10 @@ func (h *Handler) exportPool(w http.ResponseWriter, r *http.Request) {
 	pool := r.PathValue("pool")
 	if !validPoolName(pool) {
 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid pool name"), nil)
+		return
+	}
+	w, r, replayed := h.beginOperation(w, r, "pool.export", pool)
+	if replayed {
 		return
 	}
 	out, err := h.runLocal(r.Context(), ops.Step{Name: "Export pool " + pool, Argv: []string{"zpool", "export", pool}})

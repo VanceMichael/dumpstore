@@ -142,29 +142,45 @@ Reads call ZFS/system CLI tools directly. Writes are split across three lanes by
 | **Config-file / OS-resource writes** | `exec.Command(ansible-playbook)` + ndjson callback | smb.conf rendering, users/groups, TLS, ACLs, dataset property playbooks, scrub schedules, service control |
 | **Long-running data-plane** | `internal/jobs` — background process groups | `zfs send \| recv`, `zfs rewrite` |
 
-Both write lanes return the same `tasks: [...]` step shape (`ansible.TaskStep`) and stream live progress on the `ansible.progress` SSE topic — the frontend op-log cannot tell them apart. Input validation for ops-lane writes lives solely in the Go handlers. Ansible (and Python) remains a dependency only for the config-file / OS-resource features.
+Both synchronous write lanes return the same `tasks: [...]` step shape (`ansible.TaskStep`) and, once a request is accepted, record their steps on one **operation** (`internal/operations`) which owns a gapless sequence, a single terminal state and a bounded replay journal — the frontend op-log cannot tell the two lanes apart. Input validation for ops-lane writes lives solely in the Go handlers. Ansible (and Python) remains a dependency only for the config-file / OS-resource features. The long-running jobs lane is separate: it keeps its own persisted records and the `jobs.update` topic and is not wrapped in operations.
+
+### Accepted-change operations
+
+Every validated change is accepted into an `operations.Manager` before execution begins:
+
+- **Identity** — the browser sends a canonical `X-Operation-ID: op_<UUID>` (idempotency key); the server falls back to a 24-hex id. The accepted ID is echoed in the response header. Re-POSTing a known ID never executes twice (409 while running, canonical 200/500 terminal replay, 410 once history is pruned).
+- **Unified steps and terminal state** — both lanes append steps to the same operation (`running → succeeded | failed | timeout`; playbook/step timeouts wrap sentinel errors and classify as `timeout`). One request that runs several playbooks (e.g. TLS issue + config write, SMB init + apply) is one operation sharing one sequence.
+- **Resumable streams** — each operation has a `broker.Journal`: ordered, bounded, replayable (ring of events, non-blocking delivery, slow subscriber dropped exactly like the cache broker). `GET /api/operations/{id}/events` sends `id: <seq>` SSE events (`op.snapshot` full replace, `op.step`, `op.finished`); reconnects resume from `Last-Event-ID`/`?since=`, so a dropped connection — including a dropped slow subscriber — closes the gap without duplicates. `GET /api/operations/{id}` answers the deterministic result after a lost response; progress also survives client disconnect because both runners already detach the request context (`WithoutCancel`) and the operation is finalised when the response is first committed, even if that write fails.
+- **Bounded history** — ≤500 steps per operation (16 KiB/msg), ≤200 terminal operations and ≤1 h after finish, ≤256 tombstones; in-memory only (no orphan mutation exists after a process stop).
+- **Correlation** — accepted/finished log lines, per-step debug lines and the existing audit line all carry `op_id` alongside the middleware `req_id`.
+
+The cache-topic broker (`*.query`, `poolstatus`, `iostat`, `jobs.update`, …) on `/api/events` is unchanged; per-operation progress never touches it (the retired global `ansible.progress` topic has no publishers).
 
 ## Write operation request flow
 
 ```
 Browser
   │  POST /api/snapshots  {"dataset":"tank/data","snapname":"bkp"}
+  │  X-Operation-ID: op_<uuid> ; EventSource GET /api/operations/<id>/events
   ▼
 zfs_handlers.go: createSnapshot()
   │  validate input (names, labels — Go is the single validation point)
+  │  beginOperation(): manager.Start(id, "snapshot.create", …) → header echo
   │  build argv: ["zfs", "snapshot", "tank/data@bkp"]
   ▼
 internal/ops: Run(steps)          ← in-process, no shell, no Python
   │  exec zfs snapshot tank/data@bkp
-  │  step result → ansible.TaskStep{name, status, msg}
-  │  each step → ansible.progress SSE topic (live op-log)
+  │  step result → operation.AddStep (seq, ring) → broker.Journal publish
   ▼
+response committed → operation finalised (succeeded/failed/timeout)
 handlers.go: return 201 {"snapshot":"tank/data@bkp","tasks":[...]}
-  ▼
-Browser: showOpLog() renders task steps in modal
+  ▼                                      ▲
+Browser: showOpLog() renders tasks       └ op.snapshot/op.step live (per-tab
+                                                  isolated, resumable)
 
 Config-file writes (e.g. SMB shares, user creation) take the same shape
-but execute via ansible-playbook with the ndjson callback.
+but execute via ansible-playbook with the ndjson callback; multiple
+playbooks in one request append to the same operation sequence.
 ```
 
 ## Frontend
