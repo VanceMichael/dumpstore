@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 普通和 recursive dataset destroy 在执行 playbook 前解析目标及后代，并按 ZFS 实际 mountpoint 识别 SMB usershare、homes 基路径和 Time Machine 路径；存在引用时返回稳定冲突且不销毁任何对象。
+  - id: 2
+    type: f2p
+    text: iSCSI target 对目标 zvol 的引用会阻止对应 volume 或包含它的递归子树被删除，冲突结果包含可定位的 IQN 或等价 target 身份。
+  - id: 3
+    type: f2p
+    text: replication 的本机 source 以及 Remote 为空时的本机 target 会阻止精确数据集或祖先子树删除；远端 target 不被误当作本机引用，冲突结果包含任务身份和角色。
+  - id: 4
+    type: f2p
+    text: destroy 与 SMB、iSCSI、replication 消费者的创建、修改和删除共享原子准入边界；检查和执行之间并发新增引用不能造成悬空配置，解除最后引用后重试可以成功。
+  - id: 5
+    type: f2p
+    text: 任一消费者配置或后端检查失败时整体失败关闭，响应能区分依赖检查错误与正常引用冲突；已完成的其他检查不会被当作可以继续销毁的依据。
+  - id: 6
+    type: f2p
+    text: 冲突响应对多个消费者和递归后代采用确定顺序与稳定字段，前端能指出阻塞类型和身份；修复依赖或移除引用后不会保留陈旧阻塞缓存。
+  - id: 7
+    type: p2p
+    text: 无托管引用的数据集仍按原流程删除，池根保护、snapshot 专用入口、recursive 参数、既有 ZFS 错误和消费者自身 CRUD 行为保持兼容，相关回归测试通过。

@@ -129,6 +129,11 @@ func (h *Handler) setDatasetProps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Property sets can change mountpoints, which move path-reference
+	// ownership; serialise against the destroy reference check.
+	h.guard.Lock()
+	defer h.guard.Unlock()
+
 	out, err := h.runOp(r.Context(), "zfs_dataset_set.yml", vars)
 	auditLog(r.Context(), r, "dataset.modify", name, err)
 	if err != nil {
@@ -348,6 +353,11 @@ func (h *Handler) renameDataset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Renames change dataset names and (implicitly) mountpoints; serialise
+	// against destroy reference checks to keep their snapshot consistent.
+	h.guard.Lock()
+	defer h.guard.Unlock()
+
 	out, err := h.runOp(r.Context(), "zfs_dataset_rename.yml", map[string]string{
 		"name":     req.Name,
 		"new_name": req.NewName,
@@ -394,6 +404,26 @@ func (h *Handler) deleteDataset(w http.ResponseWriter, r *http.Request) {
 	recursive := "false"
 	if r.URL.Query().Get("recursive") == "true" {
 		recursive = "true"
+	}
+
+	// Reference admission boundary: gather a consistent snapshot of all
+	// dumpstore-managed consumers and run the destroy while holding the lock,
+	// so no consumer can be created/modified/removed between the check and
+	// the destroy. Any gather failure fails closed (500, no playbook).
+	h.guard.Lock()
+	defer h.guard.Unlock()
+
+	wantRecursive := recursive == "true"
+	snap, err := h.gatherRefSnapshot()
+	if err != nil {
+		writeError(r.Context(), w, http.StatusInternalServerError, fmt.Errorf("pre-destroy reference check failed: %w", err), nil)
+		return
+	}
+	if conflicts := snap.DestroyConflicts(name, wantRecursive); len(conflicts) > 0 {
+		err := fmt.Errorf("dataset %q is in use by %d dumpstore-managed consumer(s); remove them before destroying", name, len(conflicts))
+		auditLog(r.Context(), r, "dataset.destroy_blocked", name, err)
+		writeConflictError(r.Context(), w, err, conflicts)
+		return
 	}
 
 	out, err := h.runOp(r.Context(), "zfs_dataset_destroy.yml", map[string]string{

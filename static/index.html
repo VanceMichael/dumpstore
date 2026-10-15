@@ -369,6 +369,11 @@
           &#9888; Recursive mode will also destroy all child datasets and snapshots.
         </p>
       </div>
+      <div id="deleteDatasetConflicts" class="delete-conflicts" style="display:none">
+        <p class="delete-conflict-title">&#9888; Still referenced by dumpstore-managed consumers</p>
+        <ul id="deleteDatasetConflictsList"></ul>
+        <p class="muted">Remove or repoint the listed consumers, then click Delete again to retry the same request.</p>
+      </div>
       <label class="checkbox-label" style="margin:0.75rem 0">
         <input type="checkbox" id="deleteDatasetRecursive"> Recursive (also destroy all children)
       </label>

@@ -138,6 +138,12 @@ func (h *Handler) createReplication(w http.ResponseWriter, r *http.Request) {
 
 	var task replication.Task
 	req.applyTo(&task)
+
+	// Reference admission boundary: a replication source/target must not be
+	// added while a destroy reference check is in flight.
+	h.guard.Lock()
+	defer h.guard.Unlock()
+
 	stored, err := h.repl.Store().Create(task)
 	if err != nil {
 		writeError(r.Context(), w, http.StatusInternalServerError, fmt.Errorf("persist task: %w", err), nil)
@@ -171,6 +177,8 @@ func (h *Handler) updateReplication(w http.ResponseWriter, r *http.Request) {
 		writeError(r.Context(), w, http.StatusBadRequest, err, nil)
 		return
 	}
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	updated, err := h.repl.Store().Update(id, func(t *replication.Task) { req.applyTo(t) })
 	if err != nil {
 		if errors.Is(err, replication.ErrNotFound) {
@@ -196,6 +204,8 @@ func (h *Handler) deleteReplication(w http.ResponseWriter, r *http.Request) {
 		writeError(r.Context(), w, http.StatusBadRequest, errors.New("id required"), nil)
 		return
 	}
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	h.repl.Unregister(id)
 	if err := h.repl.Store().Delete(id); err != nil {
 		if errors.Is(err, replication.ErrNotFound) {

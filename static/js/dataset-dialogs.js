@@ -1,5 +1,5 @@
 import { state, storeSet } from './store.js';
-import { api, delegate, esc, fmtBytes, showOpLog, showOpLogRunning, toast, reZFSName } from './utils.js';
+import { api, delegate, esc, fmtBytes, opLogDialog, showOpLog, showOpLogRunning, toast, reZFSName } from './utils.js';
 
 // Dataset-scoped dialogs: delete, rename, rewrite, per-user quotas, ACL,
 // chown, NFS, SMB, iSCSI. Moved out of datasets.js so both the table and the
@@ -12,7 +12,19 @@ const deleteDatasetConfirm  = document.getElementById('deleteDatasetConfirmInput
 const deleteDatasetBtn      = document.getElementById('deleteDatasetConfirmBtn');
 const deleteDatasetRecursive = document.getElementById('deleteDatasetRecursive');
 const deleteDatasetChildWarn = document.getElementById('deleteDatasetChildWarning');
+const deleteDatasetConflicts = document.getElementById('deleteDatasetConflicts');
+const deleteDatasetConflictsList = document.getElementById('deleteDatasetConflictsList');
 let _deleteDatasetTarget = '';
+
+// Human labels for the stable backend conflict type tags.
+const conflictTypeLabels = {
+  smb_usershare: 'SMB share',
+  smb_homes: 'SMB home folders',
+  smb_timemachine: 'Time Machine share',
+  iscsi_target: 'iSCSI target',
+  replication_source: 'Replication source',
+  replication_local_target: 'Local replication target',
+};
 
 export function openDeleteDatasetDialog(name, type) {
   _deleteDatasetTarget = name;
@@ -21,6 +33,8 @@ export function openDeleteDatasetDialog(name, type) {
   deleteDatasetConfirm.value = '';
   deleteDatasetRecursive.checked = false;
   deleteDatasetChildWarn.style.display = 'none';
+  deleteDatasetConflicts.style.display = 'none';
+  deleteDatasetConflictsList.innerHTML = '';
   deleteDatasetBtn.disabled = true;
 
   // Volume-specific warning
@@ -56,17 +70,33 @@ deleteDatasetBtn.addEventListener('click', async () => {
   if (deleteDatasetConfirm.value !== _deleteDatasetTarget) return;
   const name = _deleteDatasetTarget;
   const recursive = deleteDatasetRecursive.checked;
-  deleteDatasetDialog.close();
+  deleteDatasetConflicts.style.display = 'none';
+  deleteDatasetBtn.disabled = true;
   showOpLogRunning(`Deleting dataset…`);
   try {
     const encodedName = name.split('/').map(encodeURIComponent).join('/');
     const url = '/api/datasets/' + encodedName + (recursive ? '?recursive=true' : '');
     const result = await api('DELETE', url);
+    deleteDatasetDialog.close();
     showOpLog(`Deleted dataset: ${name}`, result.tasks, null);
     const datasets = await api('GET', '/api/datasets');
     state.collapsedDatasets.delete(name);
     storeSet('datasets', datasets || []);
   } catch (e) {
+    // 409 with consumers: keep the dialog open and list what blocks the
+    // destroy. The same Delete click retries the request after cleanup.
+    if (e.code === 'dataset_in_use' && e.conflicts && e.conflicts.length) {
+      if (opLogDialog.open) opLogDialog.close();
+      deleteDatasetConflictsList.innerHTML = e.conflicts.map(c => {
+        const label = conflictTypeLabels[c.type] || c.type;
+        const detail = c.detail ? ` <span class="muted">${esc(c.detail)}</span>` : '';
+        return `<li><span class="delete-conflict-type">${esc(label)}</span><strong>${esc(c.name || c.id)}</strong>${detail}</li>`;
+      }).join('');
+      deleteDatasetConflicts.style.display = '';
+      deleteDatasetBtn.disabled = false;
+      return;
+    }
+    deleteDatasetDialog.close();
     showOpLog(`Failed to delete ${name}`, e.tasks, e.message);
   }
 });

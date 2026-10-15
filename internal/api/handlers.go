@@ -19,6 +19,7 @@ import (
 	"dumpstore/internal/broker"
 	"dumpstore/internal/jobs"
 	"dumpstore/internal/ops"
+	"dumpstore/internal/refs"
 	"dumpstore/internal/replication"
 	"dumpstore/internal/schema"
 	"dumpstore/internal/system"
@@ -182,9 +183,12 @@ func snapshotExists(name string) (bool, error) {
 // apiError is returned as JSON for all non-2xx responses.
 // Tasks is populated for Ansible-backed operations so the UI can show the op-log
 // even when the request fails.
+// Code/Conflicts carry the stable 409 dataset_in_use contract (see refs pkg).
 type apiError struct {
-	Error string             `json:"error"`
-	Tasks []ansible.TaskStep `json:"tasks,omitempty"`
+	Error     string             `json:"error"`
+	Code      string             `json:"code,omitempty"`
+	Conflicts []refs.Consumer    `json:"conflicts,omitempty"`
+	Tasks     []ansible.TaskStep `json:"tasks,omitempty"`
 }
 
 // Handler holds dependencies for the HTTP API.
@@ -198,6 +202,7 @@ type Handler struct {
 	autosnap   *autosnap.Runner
 	userMu     sync.Mutex   // serialises user/group write ops to avoid /etc/group lock contention
 	smbMu      sync.Mutex   // serialises smb.conf read-modify-write cycles
+	guard      *refs.Guard  // dataset-destroy reference admission boundary (outermost lock)
 	authMu     sync.RWMutex // protects concurrent access to authCfg fields
 	authCfg    *auth.Config
 	authStore  *auth.SessionStore
@@ -210,6 +215,7 @@ func NewHandler(runner *ansible.Runner, version string, b *broker.Broker, jm *jo
 	return &Handler{
 		runner:     runner,
 		ops:        ops.NewRunner(),
+		guard:      refs.NewGuard(),
 		version:    version,
 		broker:     b,
 		jobs:       jm,
@@ -540,6 +546,19 @@ func writeError(ctx context.Context, w http.ResponseWriter, code int, err error,
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(apiError{Error: err.Error(), Tasks: steps})
+}
+
+// writeConflictError writes the stable 409 dataset_in_use response listing the
+// dumpstore-managed consumers that block a dataset destroy.
+func writeConflictError(ctx context.Context, w http.ResponseWriter, err error, conflicts []refs.Consumer) {
+	slog.WarnContext(ctx, "api conflict", "status", http.StatusConflict, "err", err, "conflicts", len(conflicts))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(apiError{
+		Error:     err.Error(),
+		Code:      "dataset_in_use",
+		Conflicts: conflicts,
+	})
 }
 
 // getSchema handles GET /api/schema

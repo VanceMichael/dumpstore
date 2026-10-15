@@ -74,6 +74,9 @@ func (h *Handler) getSMBStatus(w http.ResponseWriter, r *http.Request) {
 // Preserves workgroup and server string from an existing config if present.
 // Safe to call multiple times.
 func (h *Handler) initSamba(w http.ResponseWriter, r *http.Request) {
+	// Lock order: guard (reference admission boundary) is always outermost.
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	h.smbMu.Lock()
 	defer h.smbMu.Unlock()
 
@@ -170,6 +173,8 @@ func (h *Handler) setSMBShare(w http.ResponseWriter, r *http.Request) {
 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
 		return
 	}
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	out, err := h.runOp(r.Context(), "smb_usershare_set.yml", map[string]string{
 		"dataset":   dataset,
 		"sharename": req.Sharename,
@@ -201,6 +206,8 @@ func (h *Handler) deleteSMBShare(w http.ResponseWriter, r *http.Request) {
 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
 		return
 	}
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	out, err := h.runOp(r.Context(), "smb_usershare_unset.yml", map[string]string{
 		"sharename": sharename,
 	})
@@ -391,6 +398,8 @@ func (h *Handler) setSMBHomes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	h.smbMu.Lock()
 	defer h.smbMu.Unlock()
 
@@ -429,6 +438,8 @@ func (h *Handler) deleteSMBHomes(w http.ResponseWriter, r *http.Request) {
 	if h.requireSMBInit(w, r) {
 		return
 	}
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	h.smbMu.Lock()
 	defer h.smbMu.Unlock()
 
@@ -509,6 +520,8 @@ func (h *Handler) createTimeMachineShare(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	h.smbMu.Lock()
 	defer h.smbMu.Unlock()
 
@@ -565,6 +578,8 @@ func (h *Handler) deleteTimeMachineShare(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	h.guard.Lock()
+	defer h.guard.Unlock()
 	h.smbMu.Lock()
 	defer h.smbMu.Unlock()
 

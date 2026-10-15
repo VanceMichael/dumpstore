@@ -151,6 +151,143 @@ func TestSnapshotsAndDiff(t *testing.T) {
 	}
 }
 
+// conflictResponse is the 409 dataset_in_use body shape.
+type conflictResponse struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
+	Conflicts []struct {
+		Type   string `json:"type"`
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Detail string `json:"detail"`
+	} `json:"conflicts"`
+}
+
+func conflictTypes(cr conflictResponse) map[string]string {
+	out := map[string]string{}
+	for _, c := range cr.Conflicts {
+		out[c.Type] = c.ID
+	}
+	return out
+}
+
+// TestDatasetDestroyConflicts verifies the pre-destroy reference guard using
+// local replication tasks (no SMB/iSCSI services required in the test VM):
+// a source reference and a local-target reference each block destroy with a
+// stable 409 body, the datasets survive the rejected request, and the same
+// DELETE succeeds after the blocking task is removed. Pool-root protection
+// stays in front of the check.
+func TestDatasetDestroyConflicts(t *testing.T) {
+	src := testPool + "/itest-refsrc"
+	child := src + "/child"
+	dst := testPool + "/itest-refdst"
+	standalone := testPool + "/itest-refalone"
+	var taskID string
+	for _, n := range []string{src, dst, standalone} {
+		destroyDatasetInVM(n)
+	}
+	t.Cleanup(func() {
+		if taskID != "" {
+			_, _ = api(t, "DELETE", "/api/replication/"+taskID, nil)
+		}
+		for _, n := range []string{src, dst, standalone} {
+			destroyDatasetInVM(n)
+		}
+	})
+
+	apiOK(t, "POST", "/api/datasets", map[string]any{"name": src, "type": "filesystem"})
+	apiOK(t, "POST", "/api/datasets", map[string]any{"name": child, "type": "filesystem"})
+	apiOK(t, "POST", "/api/datasets", map[string]any{"name": dst, "type": "filesystem"})
+
+	// Disabled so the scheduler never fires; the guard must still block on it.
+	taskBody := map[string]any{
+		"name":            "itest-local",
+		"source":          src,
+		"target":          dst,
+		"schedule":        "0 3 * * *",
+		"retention_count": 3,
+		"enabled":         false,
+	}
+	taskID = decode[struct {
+		ID string `json:"id"`
+	}](t, apiOK(t, "POST", "/api/replication", taskBody)).ID
+	if taskID == "" {
+		t.Fatal("replication task create returned empty id")
+	}
+
+	expectBlocked := func(path string) conflictResponse {
+		status, body := api(t, "DELETE", path, nil)
+		if status != http.StatusConflict {
+			t.Fatalf("DELETE %s: got %d, want 409; body: %s", path, status, truncate(body, 2000))
+		}
+		cr := decode[conflictResponse](t, body)
+		if cr.Code != "dataset_in_use" {
+			t.Fatalf("DELETE %s: code=%q, want dataset_in_use", path, cr.Code)
+		}
+		return cr
+	}
+
+	// Non-recursive destroy of the source: replication_source conflict only.
+	cr := expectBlocked("/api/datasets/" + src)
+	types := conflictTypes(cr)
+	if types["replication_source"] != taskID {
+		t.Fatalf("expected replication_source %s, got conflicts: %#v", taskID, cr.Conflicts)
+	}
+	if _, ok := types["replication_local_target"]; ok {
+		t.Fatalf("destroying source must not report the local target: %#v", cr.Conflicts)
+	}
+	if _, ok := datasetByName(t, src); !ok {
+		t.Fatal("source dataset must still exist after a 409")
+	}
+
+	// Recursive flag expands the check to descendants but the source still
+	// blocks — the destroy playbook must still not run.
+	cr = expectBlocked("/api/datasets/" + src + "?recursive=true")
+	if conflictTypes(cr)["replication_source"] != taskID {
+		t.Fatalf("recursive destroy: expected replication_source %s, got %#v", taskID, cr.Conflicts)
+	}
+	if _, ok := datasetByName(t, child); !ok {
+		t.Fatal("child dataset must still exist after a rejected recursive destroy")
+	}
+
+	// Destroying the local destination: replication_local_target conflict.
+	cr = expectBlocked("/api/datasets/" + dst)
+	if conflictTypes(cr)["replication_local_target"] != taskID {
+		t.Fatalf("expected replication_local_target %s, got %#v", taskID, cr.Conflicts)
+	}
+	if _, ok := datasetByName(t, dst); !ok {
+		t.Fatal("destination dataset must still exist after a 409")
+	}
+
+	// Pool roots remain rejected in front of the reference check.
+	if status, _ := api(t, "DELETE", "/api/datasets/"+testPool, nil); status != http.StatusBadRequest {
+		t.Fatalf("DELETE pool root: got %d, want 400", status)
+	}
+
+	// Remove the last blocking reference: the same request now retries
+	// successfully (recursive, to also remove the child dataset).
+	apiOK(t, "DELETE", "/api/replication/"+taskID, nil)
+	taskID = "" // cleanup closure must not hit the now-deleted task
+	apiOK(t, "DELETE", "/api/datasets/"+src+"?recursive=true", nil)
+	if _, ok := datasetByName(t, src); ok {
+		t.Fatal("source dataset still present after unblocked recursive destroy")
+	}
+	if _, ok := datasetByName(t, child); ok {
+		t.Fatal("child dataset still present after recursive destroy")
+	}
+	apiOK(t, "DELETE", "/api/datasets/"+dst, nil)
+	if _, ok := datasetByName(t, dst); ok {
+		t.Fatal("destination dataset still present after unblocked destroy")
+	}
+
+	// Unreferenced datasets keep destroying without any conflict response.
+	apiOK(t, "POST", "/api/datasets", map[string]any{"name": standalone, "type": "filesystem"})
+	apiOK(t, "DELETE", "/api/datasets/"+standalone, nil)
+	if _, ok := datasetByName(t, standalone); ok {
+		t.Fatalf("unreferenced dataset %s still present after delete", standalone)
+	}
+}
+
 // TestUserQuota sets and clears a per-user quota and verifies it via the
 // userspace report.
 func TestUserQuota(t *testing.T) {

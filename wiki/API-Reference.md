@@ -183,6 +183,23 @@ Destroy a dataset or volume. Append `?recursive=true` to also destroy all child 
 
 Pool roots (e.g. `tank`) cannot be deleted via this endpoint — use `zpool destroy`.
 
+Before running the destroy playbook the server builds a consistent snapshot of every dumpstore-managed consumer that can reference the dataset (or, with `recursive=true`, any descendant): SMB usershares, the SMB `[homes]` base path, Time Machine shares, iSCSI zvol-backed targets, replication task sources, and replication task targets when the task is local (`remote` empty). Path-based consumers are attributed by the closest actual dataset mountpoint, not by string prefix.
+
+If one or more consumers would be left dangling, the response is `409 Conflict` and the destroy playbook is **not** invoked:
+
+```json
+{
+  "error": "dataset \"tank/data\" is in use by 2 dumpstore-managed consumer(s); remove them before destroying",
+  "code": "dataset_in_use",
+  "conflicts": [
+    {"type": "smb_usershare", "id": "docs", "name": "docs", "detail": "path /tank/data/docs"},
+    {"type": "replication_source", "id": "a1b2c3d4e5f60718", "name": "nightly", "detail": "source tank/data"}
+  ]
+}
+```
+
+Conflict `type` values: `smb_usershare`, `smb_homes`, `smb_timemachine`, `iscsi_target`, `replication_source`, `replication_local_target`. `id` is the locatable handle for removal (share name, IQN, or replication task id). Remove the listed consumers and retry the same request. Any backend/config read failure during the check returns `500` and also aborts the destroy (fail closed).
+
 ---
 
 ## Snapshots

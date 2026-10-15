@@ -779,6 +779,29 @@ dialog label select:focus,
 }
 .delete-child-warning { color: var(--yellow); }
 .delete-vol-warning   { color: var(--yellow); }
+.delete-conflicts {
+  background: #2a1010;
+  border: 1px solid #5a2020;
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0 0.75rem;
+  font-size: 13px;
+}
+.delete-conflict-title { color: var(--yellow); margin: 0 0 0.4rem; }
+.delete-conflicts ul {
+  margin: 0 0 0.4rem;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.delete-conflict-type {
+  color: var(--text-muted);
+  font-family: monospace;
+  font-size: 11px;
+  margin-right: 0.35rem;
+}
+.delete-conflicts .muted { margin: 0; font-size: 12px; }
 .confirm-label {
   display: block;
   margin-top: 0.75rem;

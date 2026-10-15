@@ -109,6 +109,11 @@ func (h *Handler) createISCSITarget(w http.ResponseWriter, r *http.Request) {
 		playbook = "iscsi_target_create_freebsd.yml"
 	}
 
+	// Shares the destroy admission boundary: a zvol reference must not be
+	// added after a destroy reference check has passed.
+	h.guard.Lock()
+	defer h.guard.Unlock()
+
 	out, err := h.runOp(r.Context(), playbook, map[string]string{
 		"zvol":          req.Zvol,
 		"iqn":           req.IQN,
@@ -151,6 +156,9 @@ func (h *Handler) deleteISCSITarget(w http.ResponseWriter, r *http.Request) {
 	if backend == "freebsd" {
 		playbook = "iscsi_target_delete_freebsd.yml"
 	}
+
+	h.guard.Lock()
+	defer h.guard.Unlock()
 
 	out, err := h.runOp(r.Context(), playbook, map[string]string{"iqn": iqn, "zvol": zvol})
 	auditLog(r.Context(), r, "iscsi.delete", zvol, err)

@@ -1,0 +1,1617 @@
+diff --git a/.trae/documents/dataset_destroy_refguard_plan.md b/.trae/documents/dataset_destroy_refguard_plan.md
+new file mode 100644
+index 0000000..92510a6
+--- /dev/null
++++ b/.trae/documents/dataset_destroy_refguard_plan.md
+@@ -0,0 +1,103 @@
++# Dataset Destroy 引用准入守卫（refguard）实施计划
++
++## 背景与目标
++
++存储管理员删除文件系统 / zvol / 递归子树时，必须在调用销毁 playbook **之前**获得 dumpstore 所管理引用的一致视图；发现引用则返回稳定的 409 冲突响应且绝不执行销毁；任何后端 / 配置读取失败一律失败关闭；检查与各消费者的创建、修改、移除共用同一准入锁，消除「检查通过后新增引用」的 TOCTOU；解除引用后同一删除请求可直接重试。
++
++## Repository Research（现状结论）
++
++- 删除入口：[deleteDataset](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/api/zfs_handlers.go#L366-L411)（`DELETE /api/datasets/{name...}`）。现有顺序：名称校验 400 → 池根保护 400 → `datasetExists` 404 → 直接跑 `zfs_dataset_destroy.yml`（`zfs destroy -f [-r]`）。**当前没有任何引用检查。**
++- snapshot 专用入口 `DELETE /api/snapshots/{snapshot...}`（zfs_handlers.go:806）与批量删除（:849）独立，本次不动。
++- 消费者及配置来源：
++  1. **usershare**：playbook `smb_usershare_set.yml` 经 `net usershare add` 写入 dumpstore 独占目录 [UsershareDir](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/smb/config.go#L61-L66)（smb.conf 模板里配置 `usershare path` 指向它，故该目录内容即为权威集合）。UI 列表走 `net usershare info`（[system.ListSMBUsershares](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/system/system.go#L99-L127)），处理器为 [setSMBShare/deleteSMBShare](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/api/smb_handlers.go#L144-L213)，目前**无互斥锁**。
++  2. **homes 基路径**：smb.conf `[homes] path`（常含 `/%U` 后缀），[SMBHomesConfig.Path](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/smb/config.go#L36-L43)；set/delete 处理器持 `h.smbMu` 做整文件 render-apply。
++  3. **Time Machine 路径**：smb.conf 中带 `fruit:time machine` 的 section，[TimeMachineShare](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/smb/config.go#L45-L51)；create/delete 同样持 `h.smbMu`。
++  4. **iSCSI zvol**：[iscsi.ListTargets](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/iscsi/iscsi.go#L40-L49) 直接读 Linux `/etc/rtslib-fb-target/saveconfig.json` 或 FreeBSD `/etc/ctl.conf`；无后端返回空切片（非错误），文件读 / 解析失败返回 error。Target 含 `IQN`（定位身份）与 `ZvolName`（如 `tank/vm1`）。处理器 [createISCSITarget/deleteISCSITarget](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/api/iscsi_handlers.go#L36-L162)，**无锁**。
++  5. **replication source / 本机 target**：[replication.Task](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/replication/task.go#L37-L52)（`Source`、`Target`、`Remote`，`Remote==""` 即本机）。Store 为内存 map + tmp/rename 原子落盘（[store.go](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/replication/store.go)）。create/update/delete 处理器目前仅靠 Store 自身锁，**无跨处理器准入边界**；create 有注册失败回滚（删 task）。
++- 路径归属所需数据：[zfs.Dataset](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/zfs/zfs.go#L28-L44) 一次 `zfs list` 同时给出 `Name / Mountpoint / Type`（volume 的 mountpoint 为 `-`；legacy/none 无真实挂载点）。
++- 现有锁：Handler 上 `userMu`、`smbMu`（[handlers.go:199-200](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/api/handlers.go#L199-L206)）；错误响应统一为 `{error, tasks?}`（[apiError](file:///Users/vance/project/mineProject/swe/09101010/project-02/internal/api/handlers.go#L182-L188)）。
++- 前端删除流程：[dataset-dialogs.js:55-72](file:///Users/vance/project/mineProject/swe/09101010/project-02/static/js/dataset-dialogs.js#L55-L72) 先关对话框再发请求，失败只走 showOpLog；`api()` 抛错仅带 `error/tasks`（[utils.js:11-24](file:///Users/vance/project/mineProject/swe/09101010/project-02/static/js/utils.js#L11-L24)）。对话框 HTML 见 [index.html:362-384](file:///Users/vance/project/mineProject/swe/09101010/project-02/static/index.html#L362-L384)。
++- 集成环境（`dev/lima-linux.yaml`）只有 ZFS+Ansible，无 samba/targetcli；本机 replication 任务无需额外服务，是集成测试可依赖的消费者。
++
++## 设计决策
++
++1. **新包 `internal/refs`（纯逻辑 + 准入锁）**：不 import 任何业务包，数据结构自定义，api 层做适配。匹配逻辑可脱离 CLI/Ansible 做完整单测。
++2. **子树集合**：`recursive=false` 时仅 `{target}`；`true` 时为 target + 从同一份 `zfs list` 快照筛出的全部后代（组件边界前缀：`d==target || strings.HasPrefix(d, target+"/")`，含 volume 类型）。
++3. **mountpoint 归属（非字符串巧合）**：仅取真实绝对挂载点的 filesystem（排除 `""`、`-`、`none`、`legacy`），对配置路径 P 选「最长匹配挂载点」的数据集（`P==mp || strings.HasPrefix(P, mp+"/")`）。因此 `/tank/data2` 的 share 不会误算到 `tank/data`；路径归属到更近的子数据集时，非递归删父数据集不误报、递归删才报。
++4. **homes 基路径**：剥离 `/%U`、`/%u` 后缀及尾斜杠后做归属；路径中段出现替换符时最长前缀仍倾向阻塞（保守正确）。
++5. **iSCSI**：`ZvolName` 命中子树（等于或为其后代）即冲突，身份用 IQN，detail 带 zvol。
++6. **replication**：source 命中子树 → `replication_source`；仅 `Remote==""` 且 target 命中 → `replication_local_target`；远端任务 target 在别处、不阻塞。Enabled=false 的任务同样阻塞（配置仍悬空）。任务 source 是被删数据集**祖先**时不阻塞（递归 send 少一个子数据集，任务仍有效）。
++7. **失败关闭**：采集阶段任一读取失败 → 500，不跑销毁 playbook。SMB 未初始化（smb.conf 不存在）→ 不存在 dumpstore 管理的 SMB 引用，跳过整组 SMB 读取；已初始化则 smb.conf 解析与 usershare 目录读取都必须成功。iSCSI 无后端 = 空集合（沿用现状）；saveconfig/ctl.conf 存在但读 / 解析失败 = 错误。
++8. **准入边界**：Handler 新增 `guard *refs.Guard`（内嵌 `sync.Mutex`）。`deleteDataset` 在锁内完成「采集 → 匹配 → 销毁 playbook」全过程；下列消费者变更在**提交段**（playbook / store 写入期间）持同一把锁：
++   - usershare set/unset；homes set/delete；timemachine create/delete；smb init（顺带纳入，保证读快照一致）
++   - iscsi target create/delete
++   - replication create/update/delete（含注册失败回滚段）
++   - 另将 dataset **rename** 与 **setDatasetProps**（可改 mountpoint，影响归属）纳入同一互斥段，仅加锁、不加新校验，堵住检查快照与实际归属不一致的窗口。
++   - 锁序固定：guard 为最外层，smbMu 在内层（不存在反向获取）。
++9. **usershare 权威读取改为直接读独占目录**：在 `internal/smb` 新增 `ListUsershares(goos)`（文件名即 share 名，解析文件内 `path=` 行）；目录不存在 → 空集合；读取 / 解析失败 → error。比 shell `net usershare info`（无 share 时非零退出、无法区分错误）更确定，且该目录由 dumpstore 独占。`system.ListSMBUsershares` 保留给现有 GET 列表接口，不动。
++10. **冲突响应（稳定契约）**：HTTP 409：
++    ```json
++    {
++      "error": "dataset \"tank/data\" is in use by 2 dumpstore-managed consumer(s)",
++      "code": "dataset_in_use",
++      "conflicts": [
++        {"type": "smb_usershare", "id": "docs", "name": "docs", "detail": "path /tank/data/docs"},
++        {"type": "replication_source", "id": "a1b2c3d4", "name": "nightly", "detail": "source tank/data"}
++      ]
++    }
++    ```
++    固定 type 词汇表：`smb_usershare` / `smb_homes` / `smb_timemachine` / `iscsi_target` / `replication_source` / `replication_local_target`；`id` 为可直接定位 / 删除的身份（share 名、`homes` 固定串、TM share 名、IQN、replication task id）；输出按 `(type,id)` 排序保证稳定。
++11. **兼容性保持**：无引用时响应体与 tasks 形状不变；池根 400、非法名 400、不存在 404、`?recursive=true`、playbook 失败的 500+tasks 全部维持；snapshot 两个入口完全不引入检查。
++12. **重试**：检查无状态，DELETE 重试即重跑全流程；前端在 409 时保持对话框开启并内联展示消费者清单，解除后可直接再次点击同一删除按钮。
++13. **非目标（明确不做）**：不给 snapshot 删除加检查；不处理自动快照计划（autosnap）引用——需求枚举的六类消费者之外；不拦截正在运行的 replication job（准入边界只管配置的增改删；运行中 send/recv 与 destroy 的竞争由 ZFS busy 错误与既有 `-f` 语义兜底）；NFS sharenfs / ACL 随数据集本体销毁，无悬空配置。
++
++## Files and Modules
++
++- `internal/refs/guard.go`（新建）：`Dataset / Usershare / TMShare / SMBState / ISCSITarget / ReplTask / Snapshot / Consumer` 类型；`Guard{ mu; }`（`Lock/Unlock`）；`Snapshot.DestroyConflicts(target string, recursive bool) []Consumer`；子树筛选、最长挂载点归属、固定顺序枚举与排序；homes 基路径规范化辅助函数。
++- `internal/refs/guard_test.go`（新建）：表驱动单测（见 Validation）。
++- `internal/smb/config.go`：新增 `ListUsershares(goos) ([]UsershareFile, error)`（目录直读 + `path=` 解析）及小测试 `config` 侧的解析函数（可单测纯解析部分）。
++- `internal/api/handlers.go`：`Handler` 增加 `guard *refs.Guard`；`NewHandler` 内构造（无需改签名，`h.repl` 已在参数中）；`apiError` 增加 `Code string` 与 `Conflicts` 字段（omitempty，旧响应不受影响）；新增 `writeConflictError`。
++- `internal/api/zfs_handlers.go`：重写 `deleteDataset` 尾部（校验顺序不变，存在性确认后进入 guard：采集 → 409 或销毁）；`renameDataset`、`setDatasetProps` 的写入段加 guard。
++- 新增 `internal/api/refs_collect.go`（新建）：`gatherRefSnapshot() (refs.Snapshot, error)` 适配 zfs/smb/iscsi/replication 读取，集中失败关闭语义。
++- `internal/api/smb_handlers.go`：六个写处理器 + init 的变更段包 guard（guard→smbMu 顺序）。
++- `internal/api/iscsi_handlers.go`：create/delete runOp 段包 guard。
++- `internal/api/replication_handlers.go`：create/update/delete 的 store + scheduler 段包 guard（含回滚路径）。
++- `static/index.html`：删除对话框新增 `#deleteDatasetConflicts` 冲突清单容器（默认隐藏）。
++- `static/js/utils.js`：`api()` 抛错附带 `code`、`conflicts`。
++- `static/js/dataset-dialogs.js`：删除按钮流程改为成功后才关对话框；409 时在对话框内渲染类型标签 + 身份 + detail 并允许直接重试；其余错误维持 showOpLog。
++- `wiki/API-Reference.md`：补 DELETE /api/datasets 的 409 `dataset_in_use` 响应契约。
++- `tests/integration/api_test.go`：新增 `TestDatasetDestroyConflicts`（仅依赖 ZFS：本机 replication source/local-target 阻塞 → 删任务后重试成功；递归子树场景；无引用数据集与池根行为回归）。
++
++## Implementation Steps（依赖顺序）
++
++1. 新建 `internal/refs` 纯逻辑包（快照结构、子树 / 归属算法、冲突枚举、Guard 互斥），同步写表驱动单测并跑通。
++2. `internal/smb` 增加 usershare 目录直读函数与纯解析测试。
++3. api 层：Handler 挂 guard；新增 `gatherRefSnapshot` 采集器（失败关闭）。
++4. 改造 `deleteDataset`：guard 内采集→409 稳定响应→无冲突才调销毁 playbook；补 `writeConflictError` 与 apiError 字段。
++5. 将 guard 接入全部消费者写处理器及 rename / setDatasetProps；检查锁序（guard 外、smbMu 内）。
++6. 前端：api() 传 code/conflicts；删除对话框冲突面板与不关窗重试。
++7. 更新 wiki API-Reference。
++8. 新增集成测试（integration tag，VM 环境）。
++9. 全量 `go build ./...`、`go vet ./...`、`go test ./...`；`make dev` 手工冒烟（无引用路径与 replication 冲突路径）。
++
++## Validation
++
++- `go test ./...`（无外部依赖）必须通过；refs 单测至少覆盖：
++  - 无任何引用 → 无冲突；非递归仅查目标自身；递归覆盖全部后代（含 zvol 后代）。
++  - usershare：精确命中、子目录命中、`/tank/data2` vs `tank/data` 字符串巧合不误报、嵌套数据集归属到更近 mountpoint。
++  - homes：`/%U` 基路径剥离后命中；未启用 homes 不报。
++  - TM：路径命中与多 share 排序。
++  - iSCSI：zvol 等于 / 属于子树 → 报 IQN；非递归删父、zvol 为独立子数据集时不报。
++  - replication：source 命中；本机 target 命中；Remote 非空 target 不阻塞；disabled 任务仍阻塞；source 为祖先不阻塞。
++  - 输出按 `(type,id)` 稳定排序；消费 identity/detail 内容断言。
++- 集成测试（`go test -tags integration ...`，Lima VM）：本机 replication source 与 local target 分别触发 409，删除任务后同一 DELETE 重试 200；池根与无引用数据集行为不变。
++- 手工：`make dev` 起桩环境，造本机 replication 任务后删除数据集得到 409 清单，删任务后重试成功；前端对话框展示 / 重试流程正常。
++- 兼容性核对：snapshot 删除入口、`?recursive` 参数、playbook 失败 500+tasks、旧错误响应字段均不变。
++
++## Risks
++
++- **锁持有覆盖 playbook 执行（秒级）**：消费者写操作与销毁互相串行，功能正确但并发吞吐下降；这些操作本身低频且均为管理员显式变更，可接受。
++- **运行中 replication job 与 destroy 竞争**：不纳入配置锁（属执行面而非配置面）；本机 recv 重建目标目录属极小窗口，依赖 ZFS busy/已存在错误暴露，保持既有 ZFS 错误兼容；在代码注释与本计划中显式标注。
++- **usershare 文件格式依赖 Samba 实现**：该目录由 dumpstore 独占、由 `net usershare add` 写入，文件名与 `path=` 行格式长期稳定；解析对未知行容错，任何异常按失败关闭处理。
++- **homes 非标准替换符路径**：采用最长挂载点前缀的保守匹配，宁可阻塞也不漏报；管理员移除引用后即可重试。
++- **smb.conf / saveconfig 在已初始化状态下被外部损坏**：解析失败 → 500 失败关闭（不销毁），符合需求，管理员需先修复配置。
+diff --git a/internal/api/handlers.go b/internal/api/handlers.go
+index 6bbfb48..0035509 100644
+--- a/internal/api/handlers.go
++++ b/internal/api/handlers.go
+@@ -19,6 +19,7 @@ import (
+ 	"dumpstore/internal/broker"
+ 	"dumpstore/internal/jobs"
+ 	"dumpstore/internal/ops"
++	"dumpstore/internal/refs"
+ 	"dumpstore/internal/replication"
+ 	"dumpstore/internal/schema"
+ 	"dumpstore/internal/system"
+@@ -182,9 +183,12 @@ func snapshotExists(name string) (bool, error) {
+ // apiError is returned as JSON for all non-2xx responses.
+ // Tasks is populated for Ansible-backed operations so the UI can show the op-log
+ // even when the request fails.
++// Code/Conflicts carry the stable 409 dataset_in_use contract (see refs pkg).
+ type apiError struct {
+-	Error string             `json:"error"`
+-	Tasks []ansible.TaskStep `json:"tasks,omitempty"`
++	Error     string             `json:"error"`
++	Code      string             `json:"code,omitempty"`
++	Conflicts []refs.Consumer    `json:"conflicts,omitempty"`
++	Tasks     []ansible.TaskStep `json:"tasks,omitempty"`
+ }
+ 
+ // Handler holds dependencies for the HTTP API.
+@@ -198,6 +202,7 @@ type Handler struct {
+ 	autosnap   *autosnap.Runner
+ 	userMu     sync.Mutex   // serialises user/group write ops to avoid /etc/group lock contention
+ 	smbMu      sync.Mutex   // serialises smb.conf read-modify-write cycles
++	guard      *refs.Guard  // dataset-destroy reference admission boundary (outermost lock)
+ 	authMu     sync.RWMutex // protects concurrent access to authCfg fields
+ 	authCfg    *auth.Config
+ 	authStore  *auth.SessionStore
+@@ -210,6 +215,7 @@ func NewHandler(runner *ansible.Runner, version string, b *broker.Broker, jm *jo
+ 	return &Handler{
+ 		runner:     runner,
+ 		ops:        ops.NewRunner(),
++		guard:      refs.NewGuard(),
+ 		version:    version,
+ 		broker:     b,
+ 		jobs:       jm,
+@@ -542,6 +548,19 @@ func writeError(ctx context.Context, w http.ResponseWriter, code int, err error,
+ 	_ = json.NewEncoder(w).Encode(apiError{Error: err.Error(), Tasks: steps})
+ }
+ 
++// writeConflictError writes the stable 409 dataset_in_use response listing the
++// dumpstore-managed consumers that block a dataset destroy.
++func writeConflictError(ctx context.Context, w http.ResponseWriter, err error, conflicts []refs.Consumer) {
++	slog.WarnContext(ctx, "api conflict", "status", http.StatusConflict, "err", err, "conflicts", len(conflicts))
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusConflict)
++	_ = json.NewEncoder(w).Encode(apiError{
++		Error:     err.Error(),
++		Code:      "dataset_in_use",
++		Conflicts: conflicts,
++	})
++}
++
+ // getSchema handles GET /api/schema
+ // Returns property definitions and system metadata filtered for the current OS.
+ func (h *Handler) getSchema(w http.ResponseWriter, r *http.Request) {
+diff --git a/internal/api/iscsi_handlers.go b/internal/api/iscsi_handlers.go
+index 0e7e1c7..a584a7b 100644
+--- a/internal/api/iscsi_handlers.go
++++ b/internal/api/iscsi_handlers.go
+@@ -109,6 +109,11 @@ func (h *Handler) createISCSITarget(w http.ResponseWriter, r *http.Request) {
+ 		playbook = "iscsi_target_create_freebsd.yml"
+ 	}
+ 
++	// Shares the destroy admission boundary: a zvol reference must not be
++	// added after a destroy reference check has passed.
++	h.guard.Lock()
++	defer h.guard.Unlock()
++
+ 	out, err := h.runOp(r.Context(), playbook, map[string]string{
+ 		"zvol":          req.Zvol,
+ 		"iqn":           req.IQN,
+@@ -152,6 +157,9 @@ func (h *Handler) deleteISCSITarget(w http.ResponseWriter, r *http.Request) {
+ 		playbook = "iscsi_target_delete_freebsd.yml"
+ 	}
+ 
++	h.guard.Lock()
++	defer h.guard.Unlock()
++
+ 	out, err := h.runOp(r.Context(), playbook, map[string]string{"iqn": iqn, "zvol": zvol})
+ 	auditLog(r.Context(), r, "iscsi.delete", zvol, err)
+ 	if err != nil {
+diff --git a/internal/api/refs_collect.go b/internal/api/refs_collect.go
+new file mode 100644
+index 0000000..505d949
+--- /dev/null
++++ b/internal/api/refs_collect.go
+@@ -0,0 +1,92 @@
++package api
++
++import (
++	"fmt"
++	"runtime"
++
++	"dumpstore/internal/iscsi"
++	"dumpstore/internal/refs"
++	"dumpstore/internal/smb"
++	"dumpstore/internal/zfs"
++)
++
++// gatherRefSnapshot builds a consistent read model of every dumpstore-managed
++// consumer that can reference a ZFS dataset: SMB usershares, the [homes] base
++// path, Time Machine shares, iSCSI zvol-backed targets, and replication
++// tasks (source always; target only when the task is local).
++//
++// MUST be called with h.guard held so that no consumer create/modify/remove
++// can interleave with the read. Any backend or configuration read failure is
++// returned to the caller: the destroy path treats that as fail-closed and
++// never invokes the destroy playbook. Backend absence (SMB not initialised,
++// no iSCSI backend installed) legitimately yields empty sections.
++func (h *Handler) gatherRefSnapshot() (refs.Snapshot, error) {
++	var snap refs.Snapshot
++
++	datasets, err := zfs.ListDatasets()
++	if err != nil {
++		return snap, fmt.Errorf("list datasets for reference check: %w", err)
++	}
++	for _, d := range datasets {
++		snap.Datasets = append(snap.Datasets, refs.Dataset{
++			Name:       d.Name,
++			Mountpoint: d.Mountpoint,
++			Type:       d.Type,
++		})
++	}
++
++	goos := runtime.GOOS
++	if smb.IsInitialized(goos) {
++		snap.SMB.Initialized = true
++
++		cfg, err := smb.ParseSMBConfig(goos)
++		if err != nil {
++			return snap, fmt.Errorf("read smb config for reference check: %w", err)
++		}
++		usershares, err := smb.ListUsershares(goos)
++		if err != nil {
++			return snap, fmt.Errorf("list smb usershares for reference check: %w", err)
++		}
++		for _, u := range usershares {
++			snap.SMB.Usershares = append(snap.SMB.Usershares, refs.Usershare{
++				Name: u.Name,
++				Path: u.Path,
++			})
++		}
++		if cfg.Homes != nil {
++			snap.SMB.HomesBase = cfg.Homes.Path
++		}
++		for _, tm := range cfg.TimeMachine {
++			snap.SMB.TimeMachine = append(snap.SMB.TimeMachine, refs.TMShare{
++				Name: tm.Name,
++				Path: tm.Path,
++			})
++		}
++	}
++
++	targets, err := iscsi.ListTargets()
++	if err != nil {
++		return snap, fmt.Errorf("list iscsi targets for reference check: %w", err)
++	}
++	for _, t := range targets {
++		snap.ISCSITargets = append(snap.ISCSITargets, refs.ISCSITarget{
++			IQN:  t.IQN,
++			Zvol: t.ZvolName,
++		})
++	}
++
++	// h.repl is always wired by NewHandler; guard anyway for nil-safe tests.
++	if h.repl != nil {
++		for _, t := range h.repl.Store().List() {
++			snap.ReplTasks = append(snap.ReplTasks, refs.ReplTask{
++				ID:     t.ID,
++				Name:   t.Name,
++				Source: t.Source,
++				Target: t.Target,
++				Remote: t.Remote,
++			})
++		}
++	}
++
++	return snap, nil
++}
+diff --git a/internal/api/replication_handlers.go b/internal/api/replication_handlers.go
+index ea780f8..63a7b8d 100644
+--- a/internal/api/replication_handlers.go
++++ b/internal/api/replication_handlers.go
+@@ -138,6 +138,12 @@ func (h *Handler) createReplication(w http.ResponseWriter, r *http.Request) {
+ 
+ 	var task replication.Task
+ 	req.applyTo(&task)
++
++	// Reference admission boundary: a replication source/target must not be
++	// added while a destroy reference check is in flight.
++	h.guard.Lock()
++	defer h.guard.Unlock()
++
+ 	stored, err := h.repl.Store().Create(task)
+ 	if err != nil {
+ 		writeError(r.Context(), w, http.StatusInternalServerError, fmt.Errorf("persist task: %w", err), nil)
+@@ -171,6 +177,8 @@ func (h *Handler) updateReplication(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, err, nil)
+ 		return
+ 	}
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	updated, err := h.repl.Store().Update(id, func(t *replication.Task) { req.applyTo(t) })
+ 	if err != nil {
+ 		if errors.Is(err, replication.ErrNotFound) {
+@@ -196,6 +204,8 @@ func (h *Handler) deleteReplication(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, errors.New("id required"), nil)
+ 		return
+ 	}
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	h.repl.Unregister(id)
+ 	if err := h.repl.Store().Delete(id); err != nil {
+ 		if errors.Is(err, replication.ErrNotFound) {
+diff --git a/internal/api/smb_handlers.go b/internal/api/smb_handlers.go
+index 33acd28..ae015fb 100644
+--- a/internal/api/smb_handlers.go
++++ b/internal/api/smb_handlers.go
+@@ -74,6 +74,9 @@ func (h *Handler) getSMBStatus(w http.ResponseWriter, r *http.Request) {
+ // Preserves workgroup and server string from an existing config if present.
+ // Safe to call multiple times.
+ func (h *Handler) initSamba(w http.ResponseWriter, r *http.Request) {
++	// Lock order: guard (reference admission boundary) is always outermost.
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	h.smbMu.Lock()
+ 	defer h.smbMu.Unlock()
+ 
+@@ -170,6 +173,8 @@ func (h *Handler) setSMBShare(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
+ 		return
+ 	}
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	out, err := h.runOp(r.Context(), "smb_usershare_set.yml", map[string]string{
+ 		"dataset":   dataset,
+ 		"sharename": req.Sharename,
+@@ -201,6 +206,8 @@ func (h *Handler) deleteSMBShare(w http.ResponseWriter, r *http.Request) {
+ 		writeError(r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid sharename"), nil)
+ 		return
+ 	}
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	out, err := h.runOp(r.Context(), "smb_usershare_unset.yml", map[string]string{
+ 		"sharename": sharename,
+ 	})
+@@ -391,6 +398,8 @@ func (h *Handler) setSMBHomes(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	h.smbMu.Lock()
+ 	defer h.smbMu.Unlock()
+ 
+@@ -429,6 +438,8 @@ func (h *Handler) deleteSMBHomes(w http.ResponseWriter, r *http.Request) {
+ 	if h.requireSMBInit(w, r) {
+ 		return
+ 	}
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	h.smbMu.Lock()
+ 	defer h.smbMu.Unlock()
+ 
+@@ -509,6 +520,8 @@ func (h *Handler) createTimeMachineShare(w http.ResponseWriter, r *http.Request)
+ 		return
+ 	}
+ 
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	h.smbMu.Lock()
+ 	defer h.smbMu.Unlock()
+ 
+@@ -565,6 +578,8 @@ func (h *Handler) deleteTimeMachineShare(w http.ResponseWriter, r *http.Request)
+ 		return
+ 	}
+ 
++	h.guard.Lock()
++	defer h.guard.Unlock()
+ 	h.smbMu.Lock()
+ 	defer h.smbMu.Unlock()
+ 
+diff --git a/internal/api/zfs_handlers.go b/internal/api/zfs_handlers.go
+index 380d216..4955b27 100644
+--- a/internal/api/zfs_handlers.go
++++ b/internal/api/zfs_handlers.go
+@@ -129,6 +129,11 @@ func (h *Handler) setDatasetProps(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// Property sets can change mountpoints, which move path-reference
++	// ownership; serialise against the destroy reference check.
++	h.guard.Lock()
++	defer h.guard.Unlock()
++
+ 	out, err := h.runOp(r.Context(), "zfs_dataset_set.yml", vars)
+ 	auditLog(r.Context(), r, "dataset.modify", name, err)
+ 	if err != nil {
+@@ -348,6 +353,11 @@ func (h *Handler) renameDataset(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// Renames change dataset names and (implicitly) mountpoints; serialise
++	// against destroy reference checks to keep their snapshot consistent.
++	h.guard.Lock()
++	defer h.guard.Unlock()
++
+ 	out, err := h.runOp(r.Context(), "zfs_dataset_rename.yml", map[string]string{
+ 		"name":     req.Name,
+ 		"new_name": req.NewName,
+@@ -396,6 +406,26 @@ func (h *Handler) deleteDataset(w http.ResponseWriter, r *http.Request) {
+ 		recursive = "true"
+ 	}
+ 
++	// Reference admission boundary: gather a consistent snapshot of all
++	// dumpstore-managed consumers and run the destroy while holding the lock,
++	// so no consumer can be created/modified/removed between the check and
++	// the destroy. Any gather failure fails closed (500, no playbook).
++	h.guard.Lock()
++	defer h.guard.Unlock()
++
++	wantRecursive := recursive == "true"
++	snap, err := h.gatherRefSnapshot()
++	if err != nil {
++		writeError(r.Context(), w, http.StatusInternalServerError, fmt.Errorf("pre-destroy reference check failed: %w", err), nil)
++		return
++	}
++	if conflicts := snap.DestroyConflicts(name, wantRecursive); len(conflicts) > 0 {
++		err := fmt.Errorf("dataset %q is in use by %d dumpstore-managed consumer(s); remove them before destroying", name, len(conflicts))
++		auditLog(r.Context(), r, "dataset.destroy_blocked", name, err)
++		writeConflictError(r.Context(), w, err, conflicts)
++		return
++	}
++
+ 	out, err := h.runOp(r.Context(), "zfs_dataset_destroy.yml", map[string]string{
+ 		"name":      name,
+ 		"recursive": recursive,
+diff --git a/internal/refs/guard.go b/internal/refs/guard.go
+new file mode 100644
+index 0000000..ee37a68
+--- /dev/null
++++ b/internal/refs/guard.go
+@@ -0,0 +1,309 @@
++// Package refs implements the pre-destroy reference guard for ZFS datasets.
++//
++// Before a dataset destroy playbook runs, the API layer gathers a consistent
++// Snapshot of every dumpstore-managed consumer that can reference storage
++// objects (SMB usershares, the [homes] base path, Time Machine shares, iSCSI
++// zvol-backed targets, and replication tasks) and asks DestroyConflicts which
++// consumers would be left dangling. The package performs no I/O itself: the
++// API layer adapts the real backends (zfs/smb/iscsi/replication) into the
++// minimal data types below, which keeps the matching logic exhaustively unit
++// testable and makes "fail closed" purely an adapter concern.
++package refs
++
++import (
++	"sort"
++	"strings"
++	"sync"
++)
++
++// Stable consumer type tags. They are part of the HTTP 409 conflict response
++// contract and must not be renamed.
++const (
++	TypeSMBUsershare          = "smb_usershare"
++	TypeSMBHomes              = "smb_homes"
++	TypeSMBTimeMachine        = "smb_timemachine"
++	TypeISCSITarget           = "iscsi_target"
++	TypeReplicationSource     = "replication_source"
++	TypeReplicationLocalTarget = "replication_local_target"
++)
++
++// Dataset is the minimal ZFS dataset metadata the guard needs.
++type Dataset struct {
++	Name       string
++	Mountpoint string // as reported by `zfs list`; "-" for volumes, "legacy"/"none" possible
++	Type       string // "filesystem" or "volume"
++}
++
++// Usershare is a dumpstore-managed Samba usershare (name = share name).
++type Usershare struct {
++	Name string
++	Path string
++}
++
++// TMShare is one Time Machine share section parsed from smb.conf.
++type TMShare struct {
++	Name string
++	Path string
++}
++
++// SMBState is the SMB subset of the guard snapshot. When Initialized is false
++// (no dumpstore-managed smb.conf) the remaining fields must be ignored: no
++// dumpstore-managed SMB consumers can exist.
++type SMBState struct {
++	Initialized bool
++	HomesBase   string      // [homes] path with the %U user suffix stripped; "" when absent
++	TimeMachine []TMShare
++	Usershares  []Usershare
++}
++
++// ISCSITarget is the minimal iSCSI target identity.
++type ISCSITarget struct {
++	IQN  string // locatable handle used by DELETE /api/iscsi-targets
++	Zvol string // backing ZFS volume, e.g. "tank/vm1"
++}
++
++// ReplTask is the minimal replication task identity. Remote == "" means the
++// target is a local dataset.
++type ReplTask struct {
++	ID     string
++	Name   string
++	Source string
++	Target string
++	Remote string
++}
++
++// Snapshot is a consistent read model gathered while Guard is held.
++type Snapshot struct {
++	Datasets     []Dataset
++	SMB          SMBState
++	ISCSITargets []ISCSITarget
++	ReplTasks    []ReplTask
++}
++
++// Consumer describes one dumpstore-managed reference that blocks a destroy.
++type Consumer struct {
++	Type   string `json:"type"`
++	ID     string `json:"id"`
++	Name   string `json:"name"`
++	Detail string `json:"detail"`
++}
++
++// Guard is the shared admission boundary between dataset destroy and the
++// create/modify/remove operations of every consumer covered by Snapshot.
++// Destroy holds the lock across gather → check → playbook, and consumer
++// mutations hold it across their commit (playbook/store write), so no
++// reference can appear after the destroy check passes.
++type Guard struct {
++	mu sync.Mutex
++}
++
++// NewGuard constructs a Guard.
++func NewGuard() *Guard { return &Guard{} }
++
++// Lock acquires the admission lock.
++func (g *Guard) Lock() { g.mu.Lock() }
++
++// Unlock releases the admission lock.
++func (g *Guard) Unlock() { g.mu.Unlock() }
++
++// destroySet returns the set of dataset names the destroy would remove.
++// Non-recursive destroys remove only the target; recursive ones remove the
++// target and every descendant dataset present in the snapshot (component
++// boundary prefix — "tank/da" must not match "tank/data"). Volumes are
++// included: `zfs list` reports them alongside filesystems.
++func destroySet(target string, recursive bool, datasets []Dataset) map[string]bool {
++	set := map[string]bool{target: true}
++	if !recursive {
++		return set
++	}
++	prefix := target + "/"
++	for _, d := range datasets {
++		if strings.HasPrefix(d.Name, prefix) {
++			set[d.Name] = true
++		}
++	}
++	return set
++}
++
++// realMountpoint reports whether mp is a filesystem location a share path can
++// live under. Volumes print "-"; unmountable datasets print "legacy"/"none".
++func realMountpoint(mp string) bool {
++	return strings.HasPrefix(mp, "/")
++}
++
++// mountOwner maps a filesystem path to the dataset whose mountpoint owns it:
++// the longest mountpoint that equals the path or is a proper path-segment
++// prefix of it. Attributing by the closest mountpoint (rather than by string
++// coincidence) means a share at /tank/data/sub/x belongs to a child dataset
++// tank/data/sub when that dataset has its own mountpoint.
++//
++// Returns "" when no dataset owns the path (outside ZFS or under a
++// legacy/none mountpoint).
++type mountEntry struct {
++	mp   string
++	name string
++}
++
++func (s Snapshot) mountIndex() []mountEntry {
++	var idx []mountEntry
++	for _, d := range s.Datasets {
++		if d.Type == "volume" {
++			continue
++		}
++		if !realMountpoint(d.Mountpoint) {
++			continue
++		}
++		idx = append(idx, mountEntry{mp: strings.TrimSuffix(d.Mountpoint, "/"), name: d.Name})
++	}
++	sort.Slice(idx, func(i, j int) bool { return len(idx[i].mp) > len(idx[j].mp) })
++	return idx
++}
++
++func (s Snapshot) ownerOf(path string) string {
++	path = strings.TrimSuffix(path, "/")
++	if path == "" || !strings.HasPrefix(path, "/") {
++		return ""
++	}
++	for _, e := range s.mountIndex() {
++		if path == e.mp || strings.HasPrefix(path, e.mp+"/") {
++			return e.name
++		}
++	}
++	return ""
++}
++
++// pathBlocks reports whether a configured filesystem path is located inside
++// any dataset in the destroy set.
++func (s Snapshot) pathBlocks(path string, set map[string]bool) (string, bool) {
++	owner := s.ownerOf(path)
++	if owner == "" {
++		return "", false
++	}
++	return owner, set[owner]
++}
++
++// nameDestroyed reports whether a referenced ZFS dataset/volume name is
++// removed by the destroy. Exact set membership always counts; descendant
++// prefixes only count for recursive destroys (a non-recursive destroy leaves
++// all children in place and fails at the ZFS layer with "has children").
++// The prefix check also catches names configured in a consumer backend but
++// absent from the zfs list snapshot (stale backend config).
++func nameDestroyed(name, target string, recursive bool, set map[string]bool) bool {
++	if name == "" {
++		return false
++	}
++	if set[name] {
++		return true
++	}
++	return recursive && strings.HasPrefix(name, target+"/")
++}
++
++// homesBasePath strips the per-user substitution suffix (and trailing slash)
++// from a [homes] path to obtain the base directory that must survive.
++func homesBasePath(path string) string {
++	p := strings.TrimSpace(path)
++	p = strings.TrimSuffix(p, "/")
++	p = strings.TrimSuffix(p, "/%U")
++	p = strings.TrimSuffix(p, "/%u")
++	return strings.TrimSuffix(p, "/")
++}
++
++// DestroyConflicts returns every dumpstore-managed consumer that references
++// the target dataset (non-recursive) or the target plus its descendants
++// (recursive). The returned slice is sorted by (type, id) for a stable
++// response. A nil/empty slice means the destroy may proceed.
++func (s Snapshot) DestroyConflicts(target string, recursive bool) []Consumer {
++	set := destroySet(target, recursive, s.Datasets)
++
++	var out []Consumer
++
++	// 1. SMB usershares — path attributed by actual mountpoint ownership.
++	if s.SMB.Initialized {
++		for _, sh := range s.SMB.Usershares {
++			if _, blocked := s.pathBlocks(sh.Path, set); blocked {
++				out = append(out, Consumer{
++					Type:   TypeSMBUsershare,
++					ID:     sh.Name,
++					Name:   sh.Name,
++					Detail: "path " + sh.Path,
++				})
++			}
++		}
++
++		// 2. [homes] base path.
++		if base := homesBasePath(s.SMB.HomesBase); base != "" {
++			if _, blocked := s.pathBlocks(base, set); blocked {
++				out = append(out, Consumer{
++					Type:   TypeSMBHomes,
++					ID:     "homes",
++					Name:   "[homes]",
++					Detail: "base path " + base,
++				})
++			}
++		}
++
++		// 3. Time Machine shares.
++		for _, tm := range s.SMB.TimeMachine {
++			if _, blocked := s.pathBlocks(tm.Path, set); blocked {
++				out = append(out, Consumer{
++					Type:   TypeSMBTimeMachine,
++					ID:     tm.Name,
++					Name:   tm.Name,
++					Detail: "path " + tm.Path,
++				})
++			}
++		}
++	}
++
++	// 4. iSCSI targets backed by a zvol in the destroy subtree.
++	for _, t := range s.ISCSITargets {
++		if nameDestroyed(t.Zvol, target, recursive, set) {
++			out = append(out, Consumer{
++				Type:   TypeISCSITarget,
++				ID:     t.IQN,
++				Name:   t.IQN,
++				Detail: "zvol " + t.Zvol,
++			})
++		}
++	}
++
++	// 5/6. Replication tasks: source always; target only for local tasks
++	// (Remote == ""). A task whose source is an ANCESTOR of the target stays
++	// valid (a recursive send simply covers one fewer child) and is not
++	// reported. Disabled tasks are reported too — the stored reference would
++	// still dangle.
++	for _, t := range s.ReplTasks {
++		if nameDestroyed(t.Source, target, recursive, set) {
++			name := t.Name
++			if name == "" {
++				name = t.ID
++			}
++			out = append(out, Consumer{
++				Type:   TypeReplicationSource,
++				ID:     t.ID,
++				Name:   name,
++				Detail: "source " + t.Source,
++			})
++		}
++		if t.Remote == "" && nameDestroyed(t.Target, target, recursive, set) {
++			name := t.Name
++			if name == "" {
++				name = t.ID
++			}
++			out = append(out, Consumer{
++				Type:   TypeReplicationLocalTarget,
++				ID:     t.ID,
++				Name:   name,
++				Detail: "local target " + t.Target,
++			})
++		}
++	}
++
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].Type != out[j].Type {
++			return out[i].Type < out[j].Type
++		}
++		return out[i].ID < out[j].ID
++	})
++	return out
++}
+diff --git a/internal/refs/guard_test.go b/internal/refs/guard_test.go
+new file mode 100644
+index 0000000..7d0ec37
+--- /dev/null
++++ b/internal/refs/guard_test.go
+@@ -0,0 +1,353 @@
++package refs
++
++import (
++	"testing"
++)
++
++func baseSnapshot() Snapshot {
++	return Snapshot{
++		Datasets: []Dataset{
++			{Name: "tank", Mountpoint: "/tank", Type: "filesystem"},
++			{Name: "tank/data", Mountpoint: "/tank/data", Type: "filesystem"},
++			{Name: "tank/data/sub", Mountpoint: "/tank/data/sub", Type: "filesystem"},
++			{Name: "tank/data2", Mountpoint: "/tank/data2", Type: "filesystem"},
++			{Name: "tank/vm1", Mountpoint: "-", Type: "volume"},
++			{Name: "tank/legacy", Mountpoint: "legacy", Type: "filesystem"},
++		},
++		SMB: SMBState{Initialized: true},
++	}
++}
++
++func TestDestroyConflicts(t *testing.T) {
++	tests := []struct {
++		name      string
++		mutate    func(*Snapshot)
++		target    string
++		recursive bool
++		want      []Consumer
++	}{
++		{
++			name:      "no consumers at all",
++			target:    "tank/data",
++			recursive: false,
++			want:      nil,
++		},
++		{
++			name: "usershare exact mountpoint, non-recursive",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{{Name: "docs", Path: "/tank/data"}}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeSMBUsershare, ID: "docs", Name: "docs", Detail: "path /tank/data"},
++			},
++		},
++		{
++			name: "usershare subdirectory path",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{{Name: "docs", Path: "/tank/data/share"}}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeSMBUsershare, ID: "docs", Name: "docs", Detail: "path /tank/data/share"},
++			},
++		},
++		{
++			name: "string coincidence: /tank/data2 must not match tank/data",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{
++					{Name: "two", Path: "/tank/data2"},
++					{Name: "inside", Path: "/tank/data/x"},
++				}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeSMBUsershare, ID: "inside", Name: "inside", Detail: "path /tank/data/x"},
++			},
++		},
++		{
++			name: "path owned by closer child mountpoint: destroy parent non-recursive does not block",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{{Name: "subshare", Path: "/tank/data/sub/x"}}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want:      nil,
++		},
++		{
++			name: "path owned by closer child mountpoint: recursive destroy blocks",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{{Name: "subshare", Path: "/tank/data/sub/x"}}
++			},
++			target:    "tank/data",
++			recursive: true,
++			want: []Consumer{
++				{Type: TypeSMBUsershare, ID: "subshare", Name: "subshare", Detail: "path /tank/data/sub/x"},
++			},
++		},
++		{
++			name: "path owned by parent: recursive destroy of parent blocks even when child dataset exists elsewhere in path",
++			mutate: func(s *Snapshot) {
++				// /tank/data/other is not itself a dataset; longest owner is tank/data.
++				s.SMB.Usershares = []Usershare{{Name: "p", Path: "/tank/data/other"}}
++			},
++			target:    "tank/data",
++			recursive: true,
++			want: []Consumer{
++				{Type: TypeSMBUsershare, ID: "p", Name: "p", Detail: "path /tank/data/other"},
++			},
++		},
++		{
++			name: "share path outside ZFS never blocks",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{{Name: "etc", Path: "/srv/external"}}
++			},
++			target:    "tank/data",
++			recursive: true,
++			want:      nil,
++		},
++		{
++			name: "SMB not initialised: SMB consumers skipped entirely",
++			mutate: func(s *Snapshot) {
++				s.SMB.Initialized = false
++				s.SMB.Usershares = []Usershare{{Name: "docs", Path: "/tank/data"}}
++				s.SMB.HomesBase = "/tank/data"
++				s.SMB.TimeMachine = []TMShare{{Name: "tm", Path: "/tank/data"}}
++			},
++			target:    "tank/data",
++			recursive: true,
++			want:      nil,
++		},
++		{
++			name: "homes base path with %U suffix",
++			mutate: func(s *Snapshot) {
++				s.SMB.HomesBase = "/tank/data/%U"
++			},
++			target:    "tank/data",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeSMBHomes, ID: "homes", Name: "[homes]", Detail: "base path /tank/data"},
++			},
++		},
++		{
++			name: "homes under subdirectory with lowercase substitution and trailing slash",
++			mutate: func(s *Snapshot) {
++				s.SMB.HomesBase = "/tank/data/homes/%u/"
++			},
++			target:    "tank/data",
++			recursive: true,
++			want: []Consumer{
++				{Type: TypeSMBHomes, ID: "homes", Name: "[homes]", Detail: "base path /tank/data/homes"},
++			},
++		},
++		{
++			name: "homes absent does not block",
++			mutate: func(s *Snapshot) {
++				s.SMB.HomesBase = ""
++			},
++			target:    "tank/data",
++			recursive: false,
++			want:      nil,
++		},
++		{
++			name: "time machine shares",
++			mutate: func(s *Snapshot) {
++				s.SMB.TimeMachine = []TMShare{
++					{Name: "tm-b", Path: "/tank/data/tmb"},
++					{Name: "tm-a", Path: "/tank/data2/tm"}, // owned by tank/data2
++				}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeSMBTimeMachine, ID: "tm-b", Name: "tm-b", Detail: "path /tank/data/tmb"},
++			},
++		},
++		{
++			name: "iscsi zvol exact match",
++			mutate: func(s *Snapshot) {
++				s.ISCSITargets = []ISCSITarget{{IQN: "iqn.2020-01.com.example:vm1", Zvol: "tank/vm1"}}
++			},
++			target:    "tank/vm1",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeISCSITarget, ID: "iqn.2020-01.com.example:vm1", Name: "iqn.2020-01.com.example:vm1", Detail: "zvol tank/vm1"},
++			},
++		},
++		{
++			name: "iscsi zvol descendant blocked only on recursive destroy",
++			mutate: func(s *Snapshot) {
++				s.ISCSITargets = []ISCSITarget{{IQN: "iqn.2020-01.com.example:child", Zvol: "tank/data/vol"}}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want:      nil,
++		},
++		{
++			name: "iscsi zvol descendant blocked on recursive destroy",
++			mutate: func(s *Snapshot) {
++				s.ISCSITargets = []ISCSITarget{{IQN: "iqn.2020-01.com.example:child", Zvol: "tank/data/vol"}}
++			},
++			target:    "tank/data",
++			recursive: true,
++			want: []Consumer{
++				{Type: TypeISCSITarget, ID: "iqn.2020-01.com.example:child", Name: "iqn.2020-01.com.example:child", Detail: "zvol tank/data/vol"},
++			},
++		},
++		{
++			name: "replication local source and target both block",
++			mutate: func(s *Snapshot) {
++				s.ReplTasks = []ReplTask{{ID: "id1", Name: "nightly", Source: "tank/data", Target: "tank/backup/data", Remote: ""}}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeReplicationSource, ID: "id1", Name: "nightly", Detail: "source tank/data"},
++			},
++		},
++		{
++			name: "replication local target blocks when destroying destination subtree",
++			mutate: func(s *Snapshot) {
++				s.Datasets = append(s.Datasets, Dataset{Name: "tank/backup", Mountpoint: "/tank/backup", Type: "filesystem"})
++				s.ReplTasks = []ReplTask{{ID: "id1", Name: "nightly", Source: "tank/data", Target: "tank/backup/data", Remote: ""}}
++			},
++			target:    "tank/backup",
++			recursive: true,
++			want: []Consumer{
++				{Type: TypeReplicationLocalTarget, ID: "id1", Name: "nightly", Detail: "local target tank/backup/data"},
++			},
++		},
++		{
++			name: "remote replication target does not block; source still does",
++			mutate: func(s *Snapshot) {
++				s.Datasets = append(s.Datasets, Dataset{Name: "tank/backup", Mountpoint: "/tank/backup", Type: "filesystem"})
++				s.ReplTasks = []ReplTask{{ID: "id1", Name: "remote", Source: "tank/data", Target: "tank/backup/data", Remote: "backup@host"}}
++			},
++			target:    "tank/backup",
++			recursive: true,
++			want:      nil,
++		},
++		{
++			name: "disabled-independent: replication source descendant blocks recursively",
++			mutate: func(s *Snapshot) {
++				s.ReplTasks = []ReplTask{{ID: "id9", Name: "deep", Source: "tank/data/sub", Target: "tank/else", Remote: ""}}
++			},
++			target:    "tank/data",
++			recursive: true,
++			want: []Consumer{
++				{Type: TypeReplicationSource, ID: "id9", Name: "deep", Detail: "source tank/data/sub"},
++			},
++		},
++		{
++			name: "replication source is ancestor of destroyed dataset: not a conflict",
++			mutate: func(s *Snapshot) {
++				s.ReplTasks = []ReplTask{{ID: "id9", Name: "deep", Source: "tank", Target: "tank/else", Remote: ""}}
++			},
++			target:    "tank/data/sub",
++			recursive: true,
++			want:      nil,
++		},
++		{
++			name: "task name falls back to id in consumer display",
++			mutate: func(s *Snapshot) {
++				s.ReplTasks = []ReplTask{{ID: "id42", Source: "tank/data", Target: "tank/x", Remote: "host@remote"}}
++			},
++			target:    "tank/data",
++			recursive: false,
++			want: []Consumer{
++				{Type: TypeReplicationSource, ID: "id42", Name: "id42", Detail: "source tank/data"},
++			},
++		},
++		{
++			name: "legacy-mount dataset path references do not attribute",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{{Name: "leg", Path: "/tank/legacy"}}
++			},
++			target:    "tank/legacy",
++			recursive: true,
++			want:      nil,
++		},
++		{
++			name: "full mix is sorted by (type,id)",
++			mutate: func(s *Snapshot) {
++				s.SMB.Usershares = []Usershare{
++					{Name: "zshare", Path: "/tank/data"},
++					{Name: "ashare", Path: "/tank/data"},
++				}
++				s.SMB.HomesBase = "/tank/data"
++				s.SMB.TimeMachine = []TMShare{{Name: "tm", Path: "/tank/data"}}
++				s.ISCSITargets = []ISCSITarget{{IQN: "iqn.2020-01.com.example:vm1", Zvol: "tank/data/v"}}
++				s.ReplTasks = []ReplTask{
++					{ID: "t2", Name: "two", Source: "tank/data", Target: "tank/o2", Remote: ""},
++					{ID: "t1", Name: "one", Source: "tank/data", Target: "tank/o1", Remote: ""},
++				}
++			},
++			target:    "tank/data",
++			recursive: true,
++			want: []Consumer{
++				{Type: TypeISCSITarget, ID: "iqn.2020-01.com.example:vm1", Name: "iqn.2020-01.com.example:vm1", Detail: "zvol tank/data/v"},
++				{Type: TypeReplicationSource, ID: "t1", Name: "one", Detail: "source tank/data"},
++				{Type: TypeReplicationSource, ID: "t2", Name: "two", Detail: "source tank/data"},
++				{Type: TypeSMBHomes, ID: "homes", Name: "[homes]", Detail: "base path /tank/data"},
++				{Type: TypeSMBTimeMachine, ID: "tm", Name: "tm", Detail: "path /tank/data"},
++				{Type: TypeSMBUsershare, ID: "ashare", Name: "ashare", Detail: "path /tank/data"},
++				{Type: TypeSMBUsershare, ID: "zshare", Name: "zshare", Detail: "path /tank/data"},
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			s := baseSnapshot()
++			if tc.mutate != nil {
++				tc.mutate(&s)
++			}
++			got := s.DestroyConflicts(tc.target, tc.recursive)
++			if len(got) != len(tc.want) {
++				t.Fatalf("conflict count = %d, want %d: %#v", len(got), len(tc.want), got)
++			}
++			for i := range got {
++				if got[i] != tc.want[i] {
++					t.Errorf("conflict[%d] = %#v, want %#v", i, got[i], tc.want[i])
++				}
++			}
++		})
++	}
++}
++
++func TestHomesBasePath(t *testing.T) {
++	tests := map[string]string{
++		"/tank/data/%U":   "/tank/data",
++		"/tank/data/%u":   "/tank/data",
++		"/tank/data/%U/":  "/tank/data",
++		"/tank/data/homes": "/tank/data/homes",
++		"/tank/data/":     "/tank/data",
++		"  /tank/x/%U ":   "/tank/x",
++	}
++	for in, want := range tests {
++		if got := homesBasePath(in); got != want {
++			t.Errorf("homesBasePath(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestGuardSerialises(t *testing.T) {
++	// Sanity: Guard is a plain mutex usable as the admission boundary.
++	g := NewGuard()
++	g.Lock()
++	got := make(chan struct{})
++	go func() {
++		g.Lock()
++		defer g.Unlock()
++		close(got)
++	}()
++	select {
++	case <-got:
++		t.Fatal("guard did not serialise")
++	default:
++	}
++	g.Unlock()
++}
+diff --git a/internal/smb/usershares.go b/internal/smb/usershares.go
+new file mode 100644
+index 0000000..33cbe05
+--- /dev/null
++++ b/internal/smb/usershares.go
+@@ -0,0 +1,81 @@
++package smb
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// Usershare is one Samba usershare file in dumpstore's managed usershare
++// directory. The file name (written by `net usershare add`) is the share name.
++type Usershare struct {
++	Name string
++	Path string
++}
++
++// ListUsershares reads every usershare definition directly from the
++// dumpstore-managed usershare directory. The directory is owned exclusively
++// by dumpstore (see UsershareDir), so its files are an authoritative set
++// that does not depend on parsing `net usershare info` exit codes.
++//
++// A missing directory means SMB has never been initialised and yields a nil
++// slice with no error. Any other read failure, or a malformed usershare file
++// without a parseable path, is returned so callers (the pre-destroy reference
++// guard) can fail closed.
++func ListUsershares(goos string) ([]Usershare, error) {
++	return listUsersharesDir(UsershareDir(goos))
++}
++
++func listUsersharesDir(dir string) ([]Usershare, error) {
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil, nil
++		}
++		return nil, fmt.Errorf("read usershare dir %s: %w", dir, err)
++	}
++
++	var shares []Usershare
++	for _, e := range entries {
++		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
++			continue
++		}
++		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
++		if err != nil {
++			return nil, fmt.Errorf("read usershare %s: %w", e.Name(), err)
++		}
++		path, ok := parseUsersharePath(data)
++		if !ok {
++			return nil, fmt.Errorf("usershare %q has no parseable path", e.Name())
++		}
++		shares = append(shares, Usershare{Name: e.Name(), Path: path})
++	}
++	return shares, nil
++}
++
++// parseUsersharePath extracts the path= value from a `net usershare` file.
++// File layout (stable Samba format), one key=value per line:
++//
++//	#VERSION 0
++//	path=/tank/data
++//	comment=
++//	usershare_acl=S-1-1-0:F
++//	guest_ok=n
++func parseUsersharePath(data []byte) (string, bool) {
++	for _, line := range strings.Split(string(data), "\n") {
++		line = strings.TrimSpace(line)
++		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
++			continue
++		}
++		key, val, found := strings.Cut(line, "=")
++		if !found {
++			continue
++		}
++		if strings.TrimSpace(key) == "path" {
++			val = strings.TrimSpace(val)
++			return val, val != ""
++		}
++	}
++	return "", false
++}
+diff --git a/internal/smb/usershares_test.go b/internal/smb/usershares_test.go
+new file mode 100644
+index 0000000..9f6a3f1
+--- /dev/null
++++ b/internal/smb/usershares_test.go
+@@ -0,0 +1,81 @@
++package smb
++
++import (
++	"os"
++	"path/filepath"
++	"runtime"
++	"testing"
++)
++
++func TestParseUsersharePath(t *testing.T) {
++	content := "#VERSION 0\npath=/tank/data/docs\ncomment=\nusershare_acl=S-1-1-0:F\nguest_ok=n\n"
++	if got, ok := parseUsersharePath([]byte(content)); !ok || got != "/tank/data/docs" {
++		t.Fatalf("parseUsersharePath = %q, %v", got, ok)
++	}
++
++	if _, ok := parseUsersharePath([]byte("#VERSION 0\ncomment=\nguest_ok=n\n")); ok {
++		t.Fatal("expected no path to be reported as unparseable")
++	}
++
++	if _, ok := parseUsersharePath(nil); ok {
++		t.Fatal("nil content must not yield a path")
++	}
++}
++
++func TestListUsersharesMissingDir(t *testing.T) {
++	// UsershareDir points at a system path on the dev host (macOS) where it
++	// does not exist; this must be an empty, non-error result.
++	if got := filepath.Base(UsershareDir(runtime.GOOS)); got != "usershares" {
++		t.Fatalf("unexpected usershare dir tail: %q", got)
++	}
++	shares, err := ListUsershares(runtime.GOOS)
++	if err != nil {
++		t.Fatalf("missing usershare dir must not error: %v", err)
++	}
++	if len(shares) != 0 {
++		t.Fatalf("expected no shares, got %#v", shares)
++	}
++}
++
++func TestListUsersharesDir(t *testing.T) {
++	dir := t.TempDir()
++
++	write := func(name, content string) {
++		t.Helper()
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	write("good", "#VERSION 0\npath=/tank/a\nusershare_acl=S-1-1-0:F\nguest_ok=n\n")
++	write("other", "path=/tank/b\n")
++	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	write(".hidden", "path=/tank/hidden\n")
++
++	shares, err := listUsersharesDir(dir)
++	if err != nil {
++		t.Fatalf("listUsersharesDir: %v", err)
++	}
++	if len(shares) != 2 {
++		t.Fatalf("expected 2 shares (dotfiles and dirs skipped), got %#v", shares)
++	}
++	got := map[string]string{}
++	for _, s := range shares {
++		got[s.Name] = s.Path
++	}
++	if got["good"] != "/tank/a" || got["other"] != "/tank/b" {
++		t.Fatalf("unexpected shares: %#v", got)
++	}
++}
++
++func TestListUsersharesMalformedFails(t *testing.T) {
++	dir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(dir, "broken"), []byte("#VERSION 0\ncomment=\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := listUsersharesDir(dir); err == nil {
++		t.Fatal("malformed usershare file must produce an error so callers fail closed")
++	}
++}
+diff --git a/static/index.html b/static/index.html
+index 4d6d6ee..c576a07 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -369,6 +369,11 @@
+           &#9888; Recursive mode will also destroy all child datasets and snapshots.
+         </p>
+       </div>
++      <div id="deleteDatasetConflicts" class="delete-conflicts" style="display:none">
++        <p class="delete-conflict-title">&#9888; Still referenced by dumpstore-managed consumers</p>
++        <ul id="deleteDatasetConflictsList"></ul>
++        <p class="muted">Remove or repoint the listed consumers, then click Delete again to retry the same request.</p>
++      </div>
+       <label class="checkbox-label" style="margin:0.75rem 0">
+         <input type="checkbox" id="deleteDatasetRecursive"> Recursive (also destroy all children)
+       </label>
+diff --git a/static/js/dataset-dialogs.js b/static/js/dataset-dialogs.js
+index ef9c897..38e48e3 100644
+--- a/static/js/dataset-dialogs.js
++++ b/static/js/dataset-dialogs.js
+@@ -1,5 +1,5 @@
+ import { state, storeSet } from './store.js';
+-import { api, delegate, esc, fmtBytes, showOpLog, showOpLogRunning, toast, reZFSName } from './utils.js';
++import { api, delegate, esc, fmtBytes, opLogDialog, showOpLog, showOpLogRunning, toast, reZFSName } from './utils.js';
+ 
+ // Dataset-scoped dialogs: delete, rename, rewrite, per-user quotas, ACL,
+ // chown, NFS, SMB, iSCSI. Moved out of datasets.js so both the table and the
+@@ -12,8 +12,20 @@ const deleteDatasetConfirm  = document.getElementById('deleteDatasetConfirmInput
+ const deleteDatasetBtn      = document.getElementById('deleteDatasetConfirmBtn');
+ const deleteDatasetRecursive = document.getElementById('deleteDatasetRecursive');
+ const deleteDatasetChildWarn = document.getElementById('deleteDatasetChildWarning');
++const deleteDatasetConflicts = document.getElementById('deleteDatasetConflicts');
++const deleteDatasetConflictsList = document.getElementById('deleteDatasetConflictsList');
+ let _deleteDatasetTarget = '';
+ 
++// Human labels for the stable backend conflict type tags.
++const conflictTypeLabels = {
++  smb_usershare: 'SMB share',
++  smb_homes: 'SMB home folders',
++  smb_timemachine: 'Time Machine share',
++  iscsi_target: 'iSCSI target',
++  replication_source: 'Replication source',
++  replication_local_target: 'Local replication target',
++};
++
+ export function openDeleteDatasetDialog(name, type) {
+   _deleteDatasetTarget = name;
+   document.getElementById('deleteDatasetDisplayName').textContent = name;
+@@ -21,6 +33,8 @@ export function openDeleteDatasetDialog(name, type) {
+   deleteDatasetConfirm.value = '';
+   deleteDatasetRecursive.checked = false;
+   deleteDatasetChildWarn.style.display = 'none';
++  deleteDatasetConflicts.style.display = 'none';
++  deleteDatasetConflictsList.innerHTML = '';
+   deleteDatasetBtn.disabled = true;
+ 
+   // Volume-specific warning
+@@ -56,17 +70,33 @@ deleteDatasetBtn.addEventListener('click', async () => {
+   if (deleteDatasetConfirm.value !== _deleteDatasetTarget) return;
+   const name = _deleteDatasetTarget;
+   const recursive = deleteDatasetRecursive.checked;
+-  deleteDatasetDialog.close();
++  deleteDatasetConflicts.style.display = 'none';
++  deleteDatasetBtn.disabled = true;
+   showOpLogRunning(`Deleting dataset…`);
+   try {
+     const encodedName = name.split('/').map(encodeURIComponent).join('/');
+     const url = '/api/datasets/' + encodedName + (recursive ? '?recursive=true' : '');
+     const result = await api('DELETE', url);
++    deleteDatasetDialog.close();
+     showOpLog(`Deleted dataset: ${name}`, result.tasks, null);
+     const datasets = await api('GET', '/api/datasets');
+     state.collapsedDatasets.delete(name);
+     storeSet('datasets', datasets || []);
+   } catch (e) {
++    // 409 with consumers: keep the dialog open and list what blocks the
++    // destroy. The same Delete click retries the request after cleanup.
++    if (e.code === 'dataset_in_use' && e.conflicts && e.conflicts.length) {
++      if (opLogDialog.open) opLogDialog.close();
++      deleteDatasetConflictsList.innerHTML = e.conflicts.map(c => {
++        const label = conflictTypeLabels[c.type] || c.type;
++        const detail = c.detail ? ` <span class="muted">${esc(c.detail)}</span>` : '';
++        return `<li><span class="delete-conflict-type">${esc(label)}</span><strong>${esc(c.name || c.id)}</strong>${detail}</li>`;
++      }).join('');
++      deleteDatasetConflicts.style.display = '';
++      deleteDatasetBtn.disabled = false;
++      return;
++    }
++    deleteDatasetDialog.close();
+     showOpLog(`Failed to delete ${name}`, e.tasks, e.message);
+   }
+ });
+diff --git a/static/js/utils.js b/static/js/utils.js
+index 36e5dd1..4f175c0 100644
+--- a/static/js/utils.js
++++ b/static/js/utils.js
+@@ -18,6 +18,8 @@ export async function api(method, path, body) {
+   if (!res.ok) {
+     const err = new Error(data.error || `HTTP ${res.status}`);
+     err.tasks = data.tasks || null;
++    err.code = data.code || null;
++    err.conflicts = data.conflicts || null;
+     throw err;
+   }
+   return data;
+diff --git a/static/style.css b/static/style.css
+index d3b327d..b46e844 100644
+--- a/static/style.css
++++ b/static/style.css
+@@ -779,6 +779,29 @@ dialog label select:focus,
+ }
+ .delete-child-warning { color: var(--yellow); }
+ .delete-vol-warning   { color: var(--yellow); }
++.delete-conflicts {
++  background: #2a1010;
++  border: 1px solid #5a2020;
++  border-radius: var(--radius);
++  padding: 0.75rem 1rem;
++  margin: 0.5rem 0 0.75rem;
++  font-size: 13px;
++}
++.delete-conflict-title { color: var(--yellow); margin: 0 0 0.4rem; }
++.delete-conflicts ul {
++  margin: 0 0 0.4rem;
++  padding-left: 1.1rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.3rem;
++}
++.delete-conflict-type {
++  color: var(--text-muted);
++  font-family: monospace;
++  font-size: 11px;
++  margin-right: 0.35rem;
++}
++.delete-conflicts .muted { margin: 0; font-size: 12px; }
+ .confirm-label {
+   display: block;
+   margin-top: 0.75rem;
+diff --git a/tests/integration/api_test.go b/tests/integration/api_test.go
+index a417f45..a31ce58 100644
+--- a/tests/integration/api_test.go
++++ b/tests/integration/api_test.go
+@@ -151,6 +151,143 @@ func TestSnapshotsAndDiff(t *testing.T) {
+ 	}
+ }
+ 
++// conflictResponse is the 409 dataset_in_use body shape.
++type conflictResponse struct {
++	Error string `json:"error"`
++	Code  string `json:"code"`
++	Conflicts []struct {
++		Type   string `json:"type"`
++		ID     string `json:"id"`
++		Name   string `json:"name"`
++		Detail string `json:"detail"`
++	} `json:"conflicts"`
++}
++
++func conflictTypes(cr conflictResponse) map[string]string {
++	out := map[string]string{}
++	for _, c := range cr.Conflicts {
++		out[c.Type] = c.ID
++	}
++	return out
++}
++
++// TestDatasetDestroyConflicts verifies the pre-destroy reference guard using
++// local replication tasks (no SMB/iSCSI services required in the test VM):
++// a source reference and a local-target reference each block destroy with a
++// stable 409 body, the datasets survive the rejected request, and the same
++// DELETE succeeds after the blocking task is removed. Pool-root protection
++// stays in front of the check.
++func TestDatasetDestroyConflicts(t *testing.T) {
++	src := testPool + "/itest-refsrc"
++	child := src + "/child"
++	dst := testPool + "/itest-refdst"
++	standalone := testPool + "/itest-refalone"
++	var taskID string
++	for _, n := range []string{src, dst, standalone} {
++		destroyDatasetInVM(n)
++	}
++	t.Cleanup(func() {
++		if taskID != "" {
++			_, _ = api(t, "DELETE", "/api/replication/"+taskID, nil)
++		}
++		for _, n := range []string{src, dst, standalone} {
++			destroyDatasetInVM(n)
++		}
++	})
++
++	apiOK(t, "POST", "/api/datasets", map[string]any{"name": src, "type": "filesystem"})
++	apiOK(t, "POST", "/api/datasets", map[string]any{"name": child, "type": "filesystem"})
++	apiOK(t, "POST", "/api/datasets", map[string]any{"name": dst, "type": "filesystem"})
++
++	// Disabled so the scheduler never fires; the guard must still block on it.
++	taskBody := map[string]any{
++		"name":            "itest-local",
++		"source":          src,
++		"target":          dst,
++		"schedule":        "0 3 * * *",
++		"retention_count": 3,
++		"enabled":         false,
++	}
++	taskID = decode[struct {
++		ID string `json:"id"`
++	}](t, apiOK(t, "POST", "/api/replication", taskBody)).ID
++	if taskID == "" {
++		t.Fatal("replication task create returned empty id")
++	}
++
++	expectBlocked := func(path string) conflictResponse {
++		status, body := api(t, "DELETE", path, nil)
++		if status != http.StatusConflict {
++			t.Fatalf("DELETE %s: got %d, want 409; body: %s", path, status, truncate(body, 2000))
++		}
++		cr := decode[conflictResponse](t, body)
++		if cr.Code != "dataset_in_use" {
++			t.Fatalf("DELETE %s: code=%q, want dataset_in_use", path, cr.Code)
++		}
++		return cr
++	}
++
++	// Non-recursive destroy of the source: replication_source conflict only.
++	cr := expectBlocked("/api/datasets/" + src)
++	types := conflictTypes(cr)
++	if types["replication_source"] != taskID {
++		t.Fatalf("expected replication_source %s, got conflicts: %#v", taskID, cr.Conflicts)
++	}
++	if _, ok := types["replication_local_target"]; ok {
++		t.Fatalf("destroying source must not report the local target: %#v", cr.Conflicts)
++	}
++	if _, ok := datasetByName(t, src); !ok {
++		t.Fatal("source dataset must still exist after a 409")
++	}
++
++	// Recursive flag expands the check to descendants but the source still
++	// blocks — the destroy playbook must still not run.
++	cr = expectBlocked("/api/datasets/" + src + "?recursive=true")
++	if conflictTypes(cr)["replication_source"] != taskID {
++		t.Fatalf("recursive destroy: expected replication_source %s, got %#v", taskID, cr.Conflicts)
++	}
++	if _, ok := datasetByName(t, child); !ok {
++		t.Fatal("child dataset must still exist after a rejected recursive destroy")
++	}
++
++	// Destroying the local destination: replication_local_target conflict.
++	cr = expectBlocked("/api/datasets/" + dst)
++	if conflictTypes(cr)["replication_local_target"] != taskID {
++		t.Fatalf("expected replication_local_target %s, got %#v", taskID, cr.Conflicts)
++	}
++	if _, ok := datasetByName(t, dst); !ok {
++		t.Fatal("destination dataset must still exist after a 409")
++	}
++
++	// Pool roots remain rejected in front of the reference check.
++	if status, _ := api(t, "DELETE", "/api/datasets/"+testPool, nil); status != http.StatusBadRequest {
++		t.Fatalf("DELETE pool root: got %d, want 400", status)
++	}
++
++	// Remove the last blocking reference: the same request now retries
++	// successfully (recursive, to also remove the child dataset).
++	apiOK(t, "DELETE", "/api/replication/"+taskID, nil)
++	taskID = "" // cleanup closure must not hit the now-deleted task
++	apiOK(t, "DELETE", "/api/datasets/"+src+"?recursive=true", nil)
++	if _, ok := datasetByName(t, src); ok {
++		t.Fatal("source dataset still present after unblocked recursive destroy")
++	}
++	if _, ok := datasetByName(t, child); ok {
++		t.Fatal("child dataset still present after recursive destroy")
++	}
++	apiOK(t, "DELETE", "/api/datasets/"+dst, nil)
++	if _, ok := datasetByName(t, dst); ok {
++		t.Fatal("destination dataset still present after unblocked destroy")
++	}
++
++	// Unreferenced datasets keep destroying without any conflict response.
++	apiOK(t, "POST", "/api/datasets", map[string]any{"name": standalone, "type": "filesystem"})
++	apiOK(t, "DELETE", "/api/datasets/"+standalone, nil)
++	if _, ok := datasetByName(t, standalone); ok {
++		t.Fatalf("unreferenced dataset %s still present after delete", standalone)
++	}
++}
++
+ // TestUserQuota sets and clears a per-user quota and verifies it via the
+ // userspace report.
+ func TestUserQuota(t *testing.T) {
+diff --git a/wiki/API-Reference.md b/wiki/API-Reference.md
+index 2ba0cbf..dec12e7 100644
+--- a/wiki/API-Reference.md
++++ b/wiki/API-Reference.md
+@@ -183,6 +183,23 @@ Destroy a dataset or volume. Append `?recursive=true` to also destroy all child
+ 
+ Pool roots (e.g. `tank`) cannot be deleted via this endpoint — use `zpool destroy`.
+ 
++Before running the destroy playbook the server builds a consistent snapshot of every dumpstore-managed consumer that can reference the dataset (or, with `recursive=true`, any descendant): SMB usershares, the SMB `[homes]` base path, Time Machine shares, iSCSI zvol-backed targets, replication task sources, and replication task targets when the task is local (`remote` empty). Path-based consumers are attributed by the closest actual dataset mountpoint, not by string prefix.
++
++If one or more consumers would be left dangling, the response is `409 Conflict` and the destroy playbook is **not** invoked:
++
++```json
++{
++  "error": "dataset \"tank/data\" is in use by 2 dumpstore-managed consumer(s); remove them before destroying",
++  "code": "dataset_in_use",
++  "conflicts": [
++    {"type": "smb_usershare", "id": "docs", "name": "docs", "detail": "path /tank/data/docs"},
++    {"type": "replication_source", "id": "a1b2c3d4e5f60718", "name": "nightly", "detail": "source tank/data"}
++  ]
++}
++```
++
++Conflict `type` values: `smb_usershare`, `smb_homes`, `smb_timemachine`, `iscsi_target`, `replication_source`, `replication_local_target`. `id` is the locatable handle for removal (share name, IQN, or replication task id). Remove the listed consumers and retry the same request. Any backend/config read failure during the check returns `500` and also aborts the destroy (fail closed).
++
+ ---
+ 
+ ## Snapshots

@@ -18,6 +18,8 @@ export async function api(method, path, body) {
   if (!res.ok) {
     const err = new Error(data.error || `HTTP ${res.status}`);
     err.tasks = data.tasks || null;
+    err.code = data.code || null;
+    err.conflicts = data.conflicts || null;
     throw err;
   }
   return data;
